@@ -8,119 +8,243 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.List;
 
 public class TcpPunchTransfer {
     private static final Logger log = LoggerFactory.getLogger(TcpPunchTransfer.class);
     private static final String FAKE_HTTP_HEADER = "GET / HTTP/1.1\r\nHost: speedtest.cn\r\n\r\n";
 
-    /**
-     * 💡 终极方案：通过公网反射接口获取 100% 准确、活跃的本机公网 IPv6 地址
-     */
-    /**
-     * 💡 升级版：多重公网反射接口轮询（中国 + 全球稳定节点）
-     */
     public static InetAddress getActivePublicIpv6() {
-        // 依次尝试这三个全球最稳定的 IPv6 测速/查询接口
-        String[] apis = {
-                "https://6.ipw.cn",          // 节点1：国内极速
-                "https://api6.ipify.org",    // 节点2：全球最大 IP 服务商
-                "https://v6.ident.me"        // 节点3：经典轻量级服务
-        };
-
+        String[] apis = { "https://api6.ipify.org", "https://v6.ident.me" };
         for (String api : apis) {
             try {
-                java.net.URL url = new java.net.URL(api);
-                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
-                conn.setConnectTimeout(2500); // 💡 每个接口只给 2.5 秒，超时立刻换下一个
+                URL url = new URL(api);
+                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(2500);
                 conn.setReadTimeout(2500);
-
-                try (java.io.BufferedReader reader = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(conn.getInputStream()))) {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
                     String ipStr = reader.readLine();
                     if (ipStr != null && !ipStr.trim().isEmpty()) {
-                        log.info("🎯 通过公网反射接口 [{}] 成功定位本地 IPv6: {}", api, ipStr.trim());
-                        return java.net.InetAddress.getByName(ipStr.trim());
+                        AppLogger.info("[OK] Public IPv6 retrieved: {}", ipStr.trim());
+                        return InetAddress.getByName(ipStr.trim());
                     }
                 }
             } catch (Exception e) {
-                log.warn("⚠️ 通过接口 [{}] 获取公网 IPv6 失败，正在尝试下一个...", api);
+                AppLogger.info("[WARN] Failed to get IPv6 via [{}], trying next...", api);
             }
         }
-
-        log.error("❌ 所有公网反射接口均不可用或无网络，将启动本地网卡遍历兜底！");
         return null;
     }
 
-    // 得到本机 IPv6 地址
     public static InetAddress getLocalPhysicalIPv6() throws SocketException {
         Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
         while (interfaces.hasMoreElements()) {
             NetworkInterface ni = interfaces.nextElement();
-            if (ni.isLoopback() || !ni.isUp()) {
-                continue;
-            }
-
+            if (ni.isLoopback() || !ni.isUp()) continue;
             String name = ni.getDisplayName().toLowerCase();
-            if (name.contains("vmware") || name.contains("virtual") || name.contains("wsl")) {
-                continue;
-            }
+            if (name.contains("vmware") || name.contains("virtual") || name.contains("wsl")) continue;
 
             Enumeration<InetAddress> addresses = ni.getInetAddresses();
             while (addresses.hasMoreElements()) {
                 InetAddress addr = addresses.nextElement();
                 if (addr instanceof Inet6Address && !addr.isLinkLocalAddress()) {
-                    return addr;
+                    String ip = addr.getHostAddress().toLowerCase();
+                    if (ip.startsWith("2") || ip.startsWith("3")) {
+                        return addr;
+                    }
                 }
             }
         }
         return null;
     }
 
-    // 打 TCP 防火墙
-    public Socket connectByPunch(String remoteIp, int remotePort, int localPort) {
+    /**
+     * 💡 核心新增：获取本机所有真实物理 IPv6 字符串列表，用于进行 NAT6 检测
+     */
+    public static List<String> getLocalIPv6List() {
+        List<String> list = new ArrayList<>();
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface ni = interfaces.nextElement();
+                if (ni.isLoopback() || !ni.isUp()) continue;
+                String name = ni.getDisplayName().toLowerCase();
+                if (name.contains("vmware") || name.contains("virtual") || name.contains("wsl")) continue;
+
+                Enumeration<InetAddress> addresses = ni.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress addr = addresses.nextElement();
+                    if (addr instanceof Inet6Address && !addr.isLinkLocalAddress()) {
+                        list.add(addr.getHostAddress().toLowerCase());
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return list;
+    }
+
+    private double alignTimeByUdp(String remoteIp, int remotePort, int localPort, boolean isMaster) {
+        AppLogger.info("[UDP] Starting sync and time alignment...");
+        double slaveWaitTimeMs = 0;
+
+        try (DatagramSocket udpSocket = new DatagramSocket(null)) {
+            udpSocket.setReuseAddress(true);
+
+            InetAddress localIp = getActivePublicIpv6();
+            if (localIp == null) return 0; // 💡 没公网 IP 直接退出
+
+            udpSocket.bind(new InetSocketAddress(localIp, localPort));
+            udpSocket.setSoTimeout(300);
+
+            InetAddress remoteAddress = InetAddress.getByName(remoteIp);
+            byte[] sendBuf = "UDP_HELLO".getBytes(StandardCharsets.UTF_8);
+            byte[] receiveBuf = new byte[1024];
+            DatagramPacket receivePacket = new DatagramPacket(receiveBuf, receiveBuf.length);
+
+            boolean handshakeConnected = false;
+            long lastSendTime = 0;
+
+            while (!handshakeConnected) {
+                long now = System.currentTimeMillis();
+                if (now - lastSendTime > 300) {
+                    udpSocket.send(new DatagramPacket(sendBuf, sendBuf.length, remoteAddress, remotePort));
+                    lastSendTime = now;
+                }
+                try {
+                    udpSocket.receive(receivePacket);
+                    String msg = new String(receivePacket.getData(), 0, receivePacket.getLength(), StandardCharsets.UTF_8);
+                    if (msg.equals("UDP_HELLO") || msg.equals("UDP_HELLO_ACK")) {
+                        byte[] ack = "UDP_HELLO_ACK".getBytes(StandardCharsets.UTF_8);
+                        udpSocket.send(new DatagramPacket(ack, ack.length, remoteAddress, remotePort));
+                        handshakeConnected = true;
+                        AppLogger.info("[UDP] Handshake successful, bidirectional channel established!");
+                    }
+                } catch (SocketTimeoutException ignored) {}
+            }
+
+            if (isMaster) {
+                AppLogger.info("[UDP] Master starting RTT measurement...");
+                List<Double> rttSamples = new ArrayList<>();
+                byte[] ping = "PING_RTT".getBytes(StandardCharsets.UTF_8);
+
+                for (int i = 0; i < 3; i++) {
+                    long t1 = System.nanoTime();
+                    udpSocket.send(new DatagramPacket(ping, ping.length, remoteAddress, remotePort));
+                    try {
+                        udpSocket.receive(receivePacket);
+                        String msg = new String(receivePacket.getData(), 0, receivePacket.getLength(), StandardCharsets.UTF_8);
+                        if (msg.equals("PONG_RTT")) {
+                            long t2 = System.nanoTime();
+                            rttSamples.add((t2 - t1) / 1_000_000.0);
+                        }
+                    } catch (SocketTimeoutException ignored) {}
+                    Thread.sleep(80);
+                }
+
+                double rtt = rttSamples.isEmpty() ? 40.0 : rttSamples.stream().mapToDouble(Double::doubleValue).average().orElse(40.0);
+                double oneWayDelay = rtt / 2.0;
+                double targetDelay = 200.0;
+                double masterWait = targetDelay;
+                double slaveWait = targetDelay - oneWayDelay;
+
+                AppLogger.info("[UDP] Calibration done: RTT = {}ms", String.format("%.1f", rtt));
+
+                String syncMsg = "START_TCP_DELAY:" + slaveWait;
+                byte[] syncBytes = syncMsg.getBytes(StandardCharsets.UTF_8);
+                for (int i = 0; i < 3; i++) {
+                    udpSocket.send(new DatagramPacket(syncBytes, syncBytes.length, remoteAddress, remotePort));
+                    Thread.sleep(10);
+                }
+
+                AppLogger.info("[UDP] Master countdown: {}ms...", String.format("%.1f", masterWait));
+                return masterWait;
+
+            } else {
+                AppLogger.info("[UDP] Slave waiting for Master's command...");
+                udpSocket.setSoTimeout(3000);
+
+                while (true) {
+                    try {
+                        udpSocket.receive(receivePacket);
+                        String msg = new String(receivePacket.getData(), 0, receivePacket.getLength(), StandardCharsets.UTF_8);
+
+                        if (msg.equals("PING_RTT")) {
+                            byte[] pong = "PONG_RTT".getBytes(StandardCharsets.UTF_8);
+                            udpSocket.send(new DatagramPacket(pong, pong.length, remoteAddress, remotePort));
+                        } else if (msg.startsWith("START_TCP_DELAY:")) {
+                            slaveWaitTimeMs = Double.parseDouble(msg.split(":")[1]);
+                            break;
+                        }
+                    } catch (SocketTimeoutException e) {
+                        AppLogger.info("[UDP] Timeout waiting for command");
+                        break;
+                    }
+                }
+                AppLogger.info("[UDP] Slave countdown: {}ms...", String.format("%.1f", slaveWaitTimeMs));
+                return slaveWaitTimeMs;
+            }
+
+        } catch (Exception e) {
+            AppLogger.error("[UDP] Sync failed", e);
+        }
+        return 0;
+    }
+
+    public Socket connectByPunch(String remoteIp, int remotePort, int localPort, boolean isMaster, boolean useUdpSync) {
+        if (useUdpSync) {
+            double waitTimeMs = alignTimeByUdp(remoteIp, remotePort, localPort, isMaster);
+            if (waitTimeMs > 0) {
+                try { Thread.sleep((long) waitTimeMs); } catch (InterruptedException ignored) {}
+            }
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+        }
+
+        AppLogger.info("==================================================");
+        AppLogger.info("      ⏰ TCP Punching: START ({} mode) ⏰", useUdpSync ? "UDP-Aligned" : "Direct-Collision");
+        AppLogger.info("==================================================");
+
         int attempt = 1;
         long timeoutMs = 800;
-
         InetAddress localIp;
         localIp = getActivePublicIpv6();
         if (localIp == null) {
-            log.error("未找到本机可用的公网 IPv6 地址");
+            log.error("Failed to retrieve public IPv6");
             return null;
         }
-        log.info("本地 IPv6 IP: [{}]:{}", localIp.getHostAddress(), localPort);
 
-        // 开始碰撞
         while (true) {
             Socket socket = new Socket();
             try {
+                socket.setSendBufferSize(1500 * 1024);
+                socket.setReceiveBufferSize(1500 * 1024);
                 socket.setReuseAddress(true);
                 socket.bind(new InetSocketAddress(localIp, localPort));
 
-                log.info("尝试 {}: 发起同步连接...", attempt);
+                AppLogger.info("Attempt {}: Initiating synchronized connection...", attempt);
                 socket.connect(new InetSocketAddress(remoteIp, remotePort), (int) timeoutMs);
-
-                // 如果连上了就会到这, 没连上或者超时会到下面的 Exception
-                log.info("TCP 连接成功!");
+                AppLogger.info("[SUCCESS] TCP punch established successfully!");
 
                 OutputStream os = socket.getOutputStream();
                 InputStream is = socket.getInputStream();
 
-                // 向对面发送 FAKE_HEADER
-                os.write(FAKE_HTTP_HEADER.getBytes());
-                // 刷新流, 没够缓冲区大小也直接发送
+                os.write(FAKE_HTTP_HEADER.getBytes(StandardCharsets.UTF_8));
                 os.flush();
 
-                 byte[] cleanBuffer = new byte[FAKE_HTTP_HEADER.length()];
-                 // 读取并丢掉 Fake 报头
-                 int read = is.read(cleanBuffer);
+                int targetLength = FAKE_HTTP_HEADER.length();
+                byte[] cleanBuffer = new byte[targetLength];
+                int totalRead = 0;
+                while (totalRead < targetLength) {
+                    int read = is.read(cleanBuffer, totalRead, targetLength - totalRead);
+                    if (read == -1) throw new IOException("Connection closed prematurely");
+                    totalRead += read;
+                }
 
-                 log.info("成功发送并交换 Fake_HEADER");
-                 return socket;
+                AppLogger.info("[DPI] Successfully exchanged and cleaned FakeHTTP headers.");
+                return socket;
             } catch (Exception e) {
                 try {
-                    // 没连上会到这里
-                    // close 也会抛异常
                     socket.close();
                 } catch (IOException ignored) {}
                 attempt++;
@@ -131,16 +255,12 @@ public class TcpPunchTransfer {
         }
     }
 
-    // 在打通的 Socket 发送文件
-    // 传入一个 listener 返回实时数据
-    public void sendFile(Socket socket, File file, ProgressListener listener) {
+    public void sendFile(Socket socket, InputStream fileStream, String fileName, long fileSize, ProgressListener listener) {
         try (OutputStream os = socket.getOutputStream();
-            InputStream is = socket.getInputStream();
-            FileInputStream fis = new FileInputStream(file);
-            ProgressInputStream progressInputStream = new ProgressInputStream(fis, file.getName(), file.length(), listener);) {
+             InputStream is = socket.getInputStream();
+             ProgressInputStream progressInputStream = new ProgressInputStream(fileStream, fileName, fileSize, listener)) {
 
-            String metaData = "PREPARE:" + file.getName() + ":" + file.length() + "\n";
-            // 按照 UTF_8 编码转换为 Bytes
+            String metaData = "PREPARE:" + fileName + ":" + fileSize + "\n";
             os.write(metaData.getBytes(StandardCharsets.UTF_8));
             os.flush();
 
@@ -148,33 +268,28 @@ public class TcpPunchTransfer {
             String response = reader.readLine();
 
             if (!"ACCEPT".equals(response)) {
-                log.warn("传输被拒绝");
+                AppLogger.info("[WARN] Receiver rejected file: {}", fileName);
                 return;
             }
 
-            log.info("接收端已同意, 开始上传数据");
+            AppLogger.info("[OK] Receiver accepted. Starting upload...");
 
             byte[] buffer = new byte[65536];
             int len;
-            // 读多少, 写多少
             while ((len = progressInputStream.read(buffer)) != -1) {
                 os.write(buffer, 0, len);
             }
             os.flush();
-            log.info("文件 [{}] 发送成功", file.getName());
+            AppLogger.info("[SUCCESS] File [{}] sent successfully", fileName);
         } catch (Exception e) {
-            log.error("发送文件发生异常", e);
-        } finally {
-
+            AppLogger.error("Error occurred while sending file", e);
         }
     }
 
-    // 用打通的 Socket 接收文件
     public void receiveFile(Socket socket, String saveDir, ProgressListener listener) {
         try (InputStream is = socket.getInputStream();
-            OutputStream os = socket.getOutputStream();) {
+             OutputStream os = socket.getOutputStream()) {
 
-            // 读取元数据
             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
             String metaData = reader.readLine();
 
@@ -188,29 +303,20 @@ public class TcpPunchTransfer {
             String fileName = parts[1];
             long fileSize = Long.parseLong(parts[2]);
 
-            log.info("收到传输申请 | 文件名: {}, 大小: {} 字节", fileName, fileSize);
+            AppLogger.info("[OK] Received transfer request | Name: {}, Size: {} bytes", fileName, fileSize);
 
-            // 暂时同意
             os.write("ACCEPT\n".getBytes(StandardCharsets.UTF_8));
             os.flush();
 
             File destFile = new File(saveDir, fileName);
-            log.info("开始下载...");
+            AppLogger.info("Downloading...");
 
             try (ProgressInputStream progressInputStream = new ProgressInputStream(is, fileName, fileSize, listener)) {
                 Files.copy(progressInputStream, destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                log.info("文件 [{}] 接收成功!", fileName);
+                AppLogger.info("[SUCCESS] File [{}] received successfully!", fileName);
             }
         } catch (Exception e) {
-            log.error("接收文件发生异常", e);
-        }
-    }
-
-    private void closeSocket(Socket socket) {
-        if (socket != null && !socket.isClosed()) {
-            try {
-                socket.close();
-            } catch (IOException ignored) {}
+            AppLogger.error("Error occurred while receiving file", e);
         }
     }
 }

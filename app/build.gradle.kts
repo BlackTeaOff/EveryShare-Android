@@ -13,7 +13,7 @@ android {
 
     defaultConfig {
         applicationId = "com.blacktea.everyshare"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
@@ -59,4 +59,7 @@ dependencies {
 
     implementation("org.slf4j:slf4j-android:1.7.36")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("androidx.compose.material:material-icons-extended:1.6.3")
 }
