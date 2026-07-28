@@ -10,6 +10,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.util.Log
@@ -24,7 +25,6 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -32,7 +32,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -43,18 +43,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
-import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -66,6 +68,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.toClipEntry
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -82,12 +85,14 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import java.io.File
 import java.io.FileInputStream
-import java.io.InputStream
-import java.net.InetAddress
 import java.net.Socket
-import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.concurrent.thread
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 // 选项卡：传输、设置
 enum class ActiveTab { TRANSFER, SETTINGS }
@@ -95,9 +100,14 @@ enum class ActiveTab { TRANSFER, SETTINGS }
 // 会话状态：空闲、连接中、会话中
 enum class SessionState { IDLE, CONNECTING, ACTIVE }
 
+// 视觉配置：深色/浅色模式
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
+
+// 视觉配置：预设配色主题
+enum class AppTheme { LAVENDER, SAGE, SLATE, OAT }
+
 class MainActivity : ComponentActivity() {
     private val TAG = "EveryShare"
-    private val PORT = 50002
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -108,35 +118,176 @@ class MainActivity : ComponentActivity() {
         windowInsetsController.isAppearanceLightStatusBars = true
 
         setContent {
-            MaterialTheme {
+            val context = LocalContext.current
+
+            // 💡 1. 引入 SharedPreferences 存储，防止设置在 App 退出后重置 [1]
+            val prefs = remember { context.getSharedPreferences("everyshare_prefs", Context.MODE_PRIVATE) }
+
+            var useDynamicColor by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("use_dynamic_color", Build.VERSION.SDK_INT >= Build.VERSION_CODES.S))
+            }
+            var themeMode by rememberSaveable {
+                mutableStateOf(ThemeMode.valueOf(prefs.getString("theme_mode", ThemeMode.SYSTEM.name) ?: ThemeMode.SYSTEM.name))
+            }
+            var appTheme by rememberSaveable {
+                mutableStateOf(AppTheme.valueOf(prefs.getString("app_theme", AppTheme.SLATE.name) ?: AppTheme.SLATE.name))
+            }
+            var useUdpSync by rememberSaveable {
+                mutableStateOf(prefs.getBoolean("use_udp_sync", true))
+            }
+            var fakeHttpOption by rememberSaveable {
+                mutableStateOf(prefs.getString("fake_http_option", "speedtest.cn") ?: "speedtest.cn")
+            }
+            var customFakeHttpHost by rememberSaveable {
+                mutableStateOf(prefs.getString("custom_fake_http_host", "") ?: "")
+            }
+
+            // 💡 2. 动态计算当前是否应该使用深色主题
+            val systemInDark = isSystemInDarkTheme()
+            val isDark = when (themeMode) {
+                ThemeMode.SYSTEM -> systemInDark
+                ThemeMode.LIGHT -> false
+                ThemeMode.DARK -> true
+            }
+
+            // 💡 3. 构建当前的主题色色板
+            val rawColorScheme = when {
+                useDynamicColor && isDark && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicDarkColorScheme(context)
+                useDynamicColor && !isDark && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicLightColorScheme(context)
+                isDark -> getDarkPresetScheme(appTheme)
+                else -> getLightPresetScheme(appTheme)
+            }
+
+            // 主题切换时享受渐变动画过渡
+            val animatedColorScheme = animateColorScheme(rawColorScheme)
+
+            MaterialTheme(colorScheme = animatedColorScheme) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    EveryShareScreen()
+                    EveryShareScreen(
+                        useDynamicColor = remember { mutableStateOf(useDynamicColor) }.apply { value = useDynamicColor },
+                        themeMode = remember { mutableStateOf(themeMode) }.apply { value = themeMode },
+                        appTheme = remember { mutableStateOf(appTheme) }.apply { value = appTheme },
+                        useUdpSync = remember { mutableStateOf(useUdpSync) }.apply { value = useUdpSync },
+                        fakeHttpOption = remember { mutableStateOf(fakeHttpOption) }.apply { value = fakeHttpOption },
+                        customFakeHttpHost = remember { mutableStateOf(customFakeHttpHost) }.apply { value = customFakeHttpHost },
+                        onUseDynamicColorChange = {
+                            useDynamicColor = it
+                            prefs.edit().putBoolean("use_dynamic_color", it).apply()
+                        },
+                        onThemeModeChange = {
+                            themeMode = it
+                            prefs.edit().putString("theme_mode", it.name).apply()
+                        },
+                        onAppThemeChange = {
+                            appTheme = it
+                            prefs.edit().putString("app_theme", it.name).apply()
+                        },
+                        onUseUdpSyncChange = {
+                            useUdpSync = it
+                            prefs.edit().putBoolean("use_udp_sync", it).apply()
+                        },
+                        onFakeHttpOptionChange = {
+                            fakeHttpOption = it
+                            prefs.edit().putString("fake_http_option", it).apply()
+                        },
+                        onCustomFakeHttpHostChange = {
+                            customFakeHttpHost = it
+                            prefs.edit().putString("custom_fake_http_host", it).apply()
+                        },
+                        isDark = isDark
+                    )
                 }
             }
         }
     }
 
+    @Composable
+    private fun animateColorScheme(target: ColorScheme): ColorScheme {
+        return ColorScheme(
+            primary = animateColorAsState(target.primary, animationSpec = tween(500)).value,
+            onPrimary = animateColorAsState(target.onPrimary, animationSpec = tween(500)).value,
+            primaryContainer = animateColorAsState(target.primaryContainer, animationSpec = tween(500)).value,
+            onPrimaryContainer = animateColorAsState(target.onPrimaryContainer, animationSpec = tween(500)).value,
+            inversePrimary = animateColorAsState(target.inversePrimary, animationSpec = tween(500)).value,
+            secondary = animateColorAsState(target.secondary, animationSpec = tween(500)).value,
+            onSecondary = animateColorAsState(target.onSecondary, animationSpec = tween(500)).value,
+            secondaryContainer = animateColorAsState(target.secondaryContainer, animationSpec = tween(500)).value,
+            onSecondaryContainer = animateColorAsState(target.onSecondaryContainer, animationSpec = tween(500)).value,
+            tertiary = animateColorAsState(target.tertiary, animationSpec = tween(500)).value,
+            onTertiary = animateColorAsState(target.onTertiary, animationSpec = tween(500)).value,
+            tertiaryContainer = animateColorAsState(target.tertiaryContainer, animationSpec = tween(500)).value,
+            onTertiaryContainer = animateColorAsState(target.onTertiaryContainer, animationSpec = tween(500)).value,
+            background = animateColorAsState(target.background, animationSpec = tween(500)).value,
+            onBackground = animateColorAsState(target.onBackground, animationSpec = tween(500)).value,
+            surface = animateColorAsState(target.surface, animationSpec = tween(500)).value,
+            onSurface = animateColorAsState(target.onSurface, animationSpec = tween(500)).value,
+            surfaceVariant = animateColorAsState(target.surfaceVariant, animationSpec = tween(500)).value,
+            onSurfaceVariant = animateColorAsState(target.onSurfaceVariant, animationSpec = tween(500)).value,
+            surfaceTint = animateColorAsState(target.surfaceTint, animationSpec = tween(500)).value,
+            inverseSurface = animateColorAsState(target.inverseSurface, animationSpec = tween(500)).value,
+            inverseOnSurface = animateColorAsState(target.inverseOnSurface, animationSpec = tween(500)).value,
+            error = animateColorAsState(target.error, animationSpec = tween(500)).value,
+            onError = animateColorAsState(target.onError, animationSpec = tween(500)).value,
+            errorContainer = animateColorAsState(target.errorContainer, animationSpec = tween(500)).value,
+            onErrorContainer = animateColorAsState(target.onErrorContainer, animationSpec = tween(500)).value,
+            outline = animateColorAsState(target.outline, animationSpec = tween(500)).value,
+            outlineVariant = animateColorAsState(target.outlineVariant, animationSpec = tween(500)).value,
+            scrim = animateColorAsState(target.scrim, animationSpec = tween(500)).value,
+        )
+    }
+
+    private fun getLightPresetScheme(theme: AppTheme): ColorScheme {
+        return when (theme) {
+            AppTheme.LAVENDER -> lightColorScheme(primary = Color(0xFF8F5F6F), primaryContainer = Color(0xFFECE2E5), background = Color(0xFFF7F2F4), surface = Color.White)
+            AppTheme.SAGE -> lightColorScheme(primary = Color(0xFF5F8F6F), primaryContainer = Color(0xFFE2ECE9), background = Color(0xFFF2F7F4), surface = Color.White)
+            AppTheme.SLATE -> lightColorScheme(primary = Color(0xFF4F6F8F), primaryContainer = Color(0xFFD9E2EC), background = Color(0xFFF0F4F8), surface = Color.White)
+            AppTheme.OAT -> lightColorScheme(primary = Color(0xFF8F8A5F), primaryContainer = Color(0xFFECEBE2), background = Color(0xFFF7F7F2), surface = Color.White)
+        }
+    }
+
+    private fun getDarkPresetScheme(theme: AppTheme): ColorScheme {
+        return when (theme) {
+            AppTheme.LAVENDER -> darkColorScheme(primary = Color(0xFFF9D1DC), primaryContainer = Color(0xFF4F2A38), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+            AppTheme.SAGE -> darkColorScheme(primary = Color(0xFFD1F9D4), primaryContainer = Color(0xFF2A4F32), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+            AppTheme.SLATE -> darkColorScheme(primary = Color(0xFFD1E8F9), primaryContainer = Color(0xFF2A3F4F), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+            AppTheme.OAT -> darkColorScheme(primary = Color(0xFFF9F7D1), primaryContainer = Color(0xFF4F4B2A), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+        }
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    fun EveryShareScreen() {
+    fun EveryShareScreen(
+        useDynamicColor: MutableState<Boolean>,
+        themeMode: MutableState<ThemeMode>,
+        appTheme: MutableState<AppTheme>,
+        useUdpSync: MutableState<Boolean>,
+        fakeHttpOption: MutableState<String>,
+        customFakeHttpHost: MutableState<String>,
+        onUseDynamicColorChange: (Boolean) -> Unit,
+        onThemeModeChange: (ThemeMode) -> Unit,
+        onAppThemeChange: (AppTheme) -> Unit,
+        onUseUdpSyncChange: (Boolean) -> Unit,
+        onFakeHttpOptionChange: (String) -> Unit,
+        onCustomFakeHttpHostChange: (String) -> Unit,
+        isDark: Boolean
+    ) {
         val context = LocalContext.current
         val clipboard = LocalClipboard.current
         val scope = rememberCoroutineScope()
         val scrollState = rememberScrollState()
 
-        // 状态管理 (.value 稳健语法)
-        val currentTab = remember { mutableStateOf(ActiveTab.TRANSFER) }
-        val sessionState = remember { mutableStateOf(SessionState.IDLE) }
-        val isSenderRole = remember { mutableStateOf(true) }
+        // 状态管理 (使用 rememberSaveable 确保旋转不丢失)
+        val currentTab = rememberSaveable { mutableStateOf(ActiveTab.TRANSFER) }
+        val sessionState = rememberSaveable { mutableStateOf(SessionState.IDLE) }
+        val isSenderRole = rememberSaveable { mutableStateOf(true) }
 
         val myCode = remember { mutableStateOf("正在定位公网 IP...") }
         val myIpv6Text = remember { mutableStateOf("连接中...") }
-        val myPort = remember { mutableStateOf(50002) }
-        val remoteCode = remember { mutableStateOf("") }
-        val useUdpSync = remember { mutableStateOf(true) }
+        val myPort = rememberSaveable { mutableStateOf(50002) }
+        val remoteCode = rememberSaveable { mutableStateOf("") }
 
         val statusText = remember { mutableStateOf("等待指令") }
         val progressPercent = remember { mutableStateOf(0) }
@@ -149,12 +300,20 @@ class MainActivity : ComponentActivity() {
         val logListState = rememberLazyListState()
 
         val activeSocket = remember { mutableStateOf<Socket?>(null) }
+        val activeTransferThread = remember { mutableStateOf<Thread?>(null) }
+        var resetIpJob by remember { mutableStateOf<Job?>(null) }
 
         // 文件选择相关状态
         val selectedFileUri = remember { mutableStateOf<Uri?>(null) }
         val selectedFileName = remember { mutableStateOf("") }
         val selectedFileSize = remember { mutableStateOf(0L) }
         val isCachingFile = remember { mutableStateOf(false) }
+
+        val hasIpv6 = myIpv6Text.value != "连接中..." && myIpv6Text.value != "未连接"
+        val cardBg = if (isDark) Color(0xFF242424) else Color.White
+        val cardTextColor = if (isDark) Color.White else Color.Black
+        val activeCardBg = if (isDark) Color(0xFF203726) else Color(0xFFE3F9E4)
+        val activeCheckColor = if (isDark) Color(0xFF6CCC73) else Color(0xFF6ACD73)
 
         // 扫码器
         val scanLauncher = rememberLauncherForActivityResult(
@@ -166,36 +325,39 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 重置连接码
+        // 💡 重置连接码 (加上协程 delay，防止冷启动和界面返回时抢占 CPU 造成 UI 卡顿)
         fun resetMyConnectionCode() {
-            this@MainActivity.runOnUiThread {
-                myIpv6Text.value = "连接中..."
-                myCode.value = "正在定位公网 IP..."
-            }
-            thread {
+            resetIpJob?.cancel()
+            myIpv6Text.value = "连接中..."
+            myCode.value = "正在定位公网 IP..."
+
+            resetIpJob = scope.launch(Dispatchers.IO) {
+                delay(400)
                 try {
-                    val myIpv6 = TcpPunchTransfer.getActivePublicIpv6()
+                    val myIpv6 = withTimeoutOrNull(4000) {
+                        TcpPunchTransfer.getActivePublicIpv6()
+                    }
+
                     if (myIpv6 != null) {
                         val randomPort = 50000 + (Math.random() * 10000).toInt()
                         myPort.value = randomPort
-                        myCode.value = ConnectionCodeUtil.generateCode(myIpv6.hostAddress, randomPort)
+                        val generatedCode = ConnectionCodeUtil.generateCode(myIpv6.hostAddress, randomPort)
 
-                        // 自动进行 NAT6 探测检测
                         val localIps = TcpPunchTransfer.getLocalIPv6List()
                         val isNat6 = !localIps.contains(myIpv6.hostAddress.lowercase())
 
-                        this@MainActivity.runOnUiThread {
+                        withContext(Dispatchers.Main) {
+                            myCode.value = generatedCode
                             myIpv6Text.value = if (isNat6) "${myIpv6.hostAddress}\n<NAT6 转换>" else myIpv6.hostAddress
                         }
                     } else {
-                        this@MainActivity.runOnUiThread {
+                        withContext(Dispatchers.Main) {
                             myIpv6Text.value = "未连接"
                             myCode.value = "定位失败"
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "重置连接码失败", e)
-                    this@MainActivity.runOnUiThread {
+                    withContext(Dispatchers.Main) {
                         myIpv6Text.value = "未连接"
                         myCode.value = "定位失败"
                     }
@@ -203,7 +365,28 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 自动网络环境监听 [2]
+        // 退出连接并中止后台线程 (💡 增加 500ms 延迟重置 IP，让前台返回过渡动画完全放完后再检测网络，防止卡顿)
+        fun cancelActiveTransfer() {
+            thread {
+                try {
+                    activeTransferThread.value?.interrupt()
+                    activeTransferThread.value = null
+                    activeSocket.value?.close()
+                    activeSocket.value = null
+                } catch (ignored: Exception) {}
+
+                this@MainActivity.runOnUiThread {
+                    isTransferring.value = false
+                    sessionState.value = SessionState.IDLE
+                    statusText.value = "已取消连接并返回"
+                }
+
+                try { Thread.sleep(500) } catch (ignored: Exception) {}
+                resetMyConnectionCode()
+            }
+        }
+
+        // 自动网络环境监听
         DisposableEffect(Unit) {
             val connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -225,22 +408,11 @@ class MainActivity : ComponentActivity() {
 
         // 拦截系统返回键
         BackHandler(enabled = sessionState.value != SessionState.IDLE) {
-            thread {
-                try {
-                    activeSocket.value?.close()
-                    activeSocket.value = null
-                } catch (ignored: Exception) {}
-                this@MainActivity.runOnUiThread {
-                    isTransferring.value = false
-                    sessionState.value = SessionState.IDLE
-                    statusText.value = "已返回首页"
-                }
-                resetMyConnectionCode()
-            }
+            cancelActiveTransfer()
         }
 
         // 文件选择器
-        val filePickerLauncher = rememberLauncherForActivityResult(
+        val filePickerLauncher = rememberLauncherForActivityResult<String, Uri?>(
             contract = ActivityResultContracts.GetContent()
         ) { uri: Uri? ->
             if (uri != null) {
@@ -264,7 +436,7 @@ class MainActivity : ComponentActivity() {
                             isCachingFile.value = false
                         }
                     } catch (e: Exception) {
-                        Log.e(TAG, "缓存文件失败", e)
+                        AppLogger.error("缓存文件失败", e)
                         this@MainActivity.runOnUiThread {
                             statusText.value = "缓存失败"
                             isCachingFile.value = false
@@ -279,6 +451,10 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(Unit) {
             System.setProperty("java.net.preferIPv6Addresses", "true")
             System.setProperty("java.net.preferIPv4Stack", "false")
+
+            // 💡 启动时立即同步已经积攒的全局历史日志，统一前台后台控制台
+            logList.clear()
+            logList.addAll(AppLogger.logs)
 
             AppLogger.onLogAdded = Runnable {
                 this@MainActivity.runOnUiThread {
@@ -305,7 +481,7 @@ class MainActivity : ComponentActivity() {
                 verticalArrangement = Arrangement.spacedBy(16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // 💡 页面级左右滑动过渡动画，标题与卡片整体划过
+                // 页面级左右滑动过渡动画
                 AnimatedContent(
                     targetState = currentTab.value,
                     transitionSpec = {
@@ -343,7 +519,7 @@ class MainActivity : ComponentActivity() {
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     if (state == SessionState.IDLE) {
-                                        // 标题左对齐 (与 KernelSU 一致)
+                                        // 标题左对齐
                                         Text(
                                             text = "EveryShare",
                                             fontSize = 32.sp,
@@ -353,20 +529,18 @@ class MainActivity : ComponentActivity() {
                                             textAlign = TextAlign.Start
                                         )
 
-                                        // 说明文案卡片化 (💡 去掉投影效果，采用极轻扁平微细边框设计，高级极简)
+                                        // 说明文案卡片
                                         Card(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .border(1.dp, Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(16.dp)),
+                                            modifier = Modifier.fillMaxWidth(),
                                             shape = RoundedCornerShape(16.dp),
-                                            colors = CardDefaults.cardColors(containerColor = Color.White),
-                                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp) // 💡 彻底去掉阴影
+                                            colors = CardDefaults.cardColors(containerColor = cardBg),
+                                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                         ) {
                                             Text(
                                                 text = "仅支持公网 IPv6 地址互传，当前版本为 AI 测试版。\n有 BUG 可以提 Issue，但是不一定能改好。",
                                                 fontSize = 11.sp,
                                                 lineHeight = 16.sp,
-                                                color = Color.Gray,
+                                                color = if (isDark) Color.LightGray else Color.Gray,
                                                 modifier = Modifier.padding(14.dp),
                                                 textAlign = TextAlign.Start
                                             )
@@ -374,37 +548,36 @@ class MainActivity : ComponentActivity() {
 
                                         Spacer(modifier = Modifier.height(2.dp))
 
-                                        // Bento Box 仪表盘 (1:1 绝对对称，长度 180.dp)
+                                        // Bento Box 仪表盘 (1:1 绝对对称)
                                         Row(
                                             modifier = Modifier.fillMaxWidth().height(180.dp),
                                             horizontalArrangement = Arrangement.spacedBy(12.dp)
                                         ) {
                                             val isConnecting = myIpv6Text.value == "连接中..."
-                                            val hasIpv6 = !isConnecting && myIpv6Text.value != "未连接"
+                                            val hasIpv6Status = !isConnecting && myIpv6Text.value != "未连接"
 
-                                            // 左侧大卡片 (KernelSU 描边对勾右下角对齐与裁剪)
+                                            // 左侧大卡片 (3D 物理下沉变暗 ＋ 倾斜动效)
                                             Card(
                                                 modifier = Modifier
                                                     .weight(1f)
                                                     .fillMaxHeight()
-                                                    .clip(RoundedCornerShape(24.dp))
-                                                    // 💡 3D 物理下沉变暗 ＋ 倾斜动效，点击自动触发连接重置
                                                     .bounceClick { resetMyConnectionCode() },
+                                                shape = RoundedCornerShape(24.dp),
                                                 colors = CardDefaults.cardColors(
-                                                    containerColor = if (hasIpv6) Color(0xFFE3F9E4) else if (isConnecting) Color(0xFFFFF3E0) else Color(0xFFFFEBEE)
+                                                    containerColor = if (hasIpv6Status) activeCardBg else if (isConnecting) (if (isDark) Color(0xFF4F3A1A) else Color(0xFFFFF3E0)) else (if (isDark) Color(0xFF4F1A1E) else Color(0xFFFFEBEE))
                                                 )
                                             ) {
                                                 Box(modifier = Modifier.fillMaxSize()) {
-                                                    // 💡 极致视觉：圆圈再度变大至 140.dp，描边加粗至 14.dp，移到【右下角】并进行边缘裁剪，对勾右腿略微加长
-                                                    if (hasIpv6) {
+                                                    // 描边大圆圈
+                                                    if (hasIpv6Status) {
                                                         Canvas(
                                                             modifier = Modifier
-                                                                .size(140.dp) // 💡 大圆圈
-                                                                .align(Alignment.BottomEnd) // 💡 精确对齐右下角
-                                                                .offset(x = 35.dp, y = 35.dp) // 💡 右下角裁剪偏移
+                                                                .size(140.dp)
+                                                                .align(Alignment.BottomEnd)
+                                                                .offset(x = 35.dp, y = 35.dp)
                                                         ) {
-                                                            val strokeWidth = 14.dp.toPx() // 💡 极粗描边 14.dp
-                                                            val circleColor = Color(0xFF6ACD73)
+                                                            val strokeWidth = 14.dp.toPx()
+                                                            val circleColor = activeCheckColor
 
                                                             drawCircle(
                                                                 color = circleColor,
@@ -412,7 +585,6 @@ class MainActivity : ComponentActivity() {
                                                                 style = Stroke(width = strokeWidth)
                                                             )
                                                             val path = Path().apply {
-                                                                // 💡 完美收拢在 140.dp 内部，且右腿稍微拉长
                                                                 moveTo(size.width * 0.38f, size.height * 0.52f)
                                                                 lineTo(size.width * 0.48f, size.height * 0.64f)
                                                                 lineTo(size.width * 0.68f, size.height * 0.40f)
@@ -431,10 +603,10 @@ class MainActivity : ComponentActivity() {
 
                                                     Column(modifier = Modifier.padding(16.dp)) {
                                                         Text(
-                                                            text = if (hasIpv6) "服务中" else if (isConnecting) "连接中..." else "未连接",
+                                                            text = if (hasIpv6Status) "服务中" else if (isConnecting) "连接中..." else "未连接",
                                                             fontWeight = FontWeight.ExtraBold,
                                                             fontSize = 20.sp,
-                                                            color = Color.Black
+                                                            color = cardTextColor
                                                         )
                                                         Spacer(modifier = Modifier.height(6.dp))
                                                         Text(
@@ -442,13 +614,13 @@ class MainActivity : ComponentActivity() {
                                                             fontSize = 9.sp,
                                                             lineHeight = 13.sp,
                                                             fontFamily = FontFamily.Monospace,
-                                                            color = Color.DarkGray
+                                                            color = if (isDark) Color.LightGray else Color.DarkGray
                                                         )
                                                     }
                                                 }
                                             }
 
-                                            // 右侧两个小卡片，底色改纯白，无阴影，使用内置 border 对齐，排版上下均匀分布
+                                            // 右侧两个小卡片
                                             Column(
                                                 modifier = Modifier.weight(1f).fillMaxHeight(),
                                                 verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -457,40 +629,40 @@ class MainActivity : ComponentActivity() {
                                                     modifier = Modifier
                                                         .fillMaxWidth()
                                                         .weight(1f)
-                                                        .bounceClick { resetMyConnectionCode() }, // 💡 点击快捷重置
+                                                        .bounceClick { resetMyConnectionCode() },
                                                     shape = RoundedCornerShape(16.dp),
-                                                    border = BorderStroke(1.dp, Color.LightGray.copy(alpha = 0.2f)), // 💡 使用内置 border 彻底消除漏边
-                                                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                                                    colors = CardDefaults.cardColors(containerColor = cardBg),
                                                     elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                                 ) {
                                                     Column(
                                                         modifier = Modifier.padding(14.dp).fillMaxHeight(),
-                                                        verticalArrangement = Arrangement.SpaceBetween // 💡 空间均匀分布
+                                                        verticalArrangement = Arrangement.SpaceBetween
                                                     ) {
-                                                        Text(text = "本地随机端口", fontSize = 13.sp, color = Color.Gray) // 💡 灰色字体加大到 13.sp
-                                                        Text(text = myPort.value.toString(), fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                                                        // 💡 视觉统一：修改为“传输策略”
+                                                        Text(text = "传输策略", fontSize = 13.sp, color = Color.Gray)
+                                                        Text(text = myPort.value.toString(), fontSize = 18.sp, fontWeight = FontWeight.Bold, color = cardTextColor)
                                                     }
                                                 }
                                                 Card(
                                                     modifier = Modifier
                                                         .fillMaxWidth()
                                                         .weight(1f)
-                                                        .bounceClick { resetMyConnectionCode() }, // 💡 点击快捷重置
+                                                        .bounceClick { resetMyConnectionCode() },
                                                     shape = RoundedCornerShape(16.dp),
-                                                    border = BorderStroke(1.dp, Color.LightGray.copy(alpha = 0.2f)),
-                                                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                                                    colors = CardDefaults.cardColors(containerColor = cardBg),
                                                     elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                                 ) {
                                                     Column(
                                                         modifier = Modifier.padding(14.dp).fillMaxHeight(),
-                                                        verticalArrangement = Arrangement.SpaceBetween // 💡 空间均匀分布
+                                                        verticalArrangement = Arrangement.SpaceBetween
                                                     ) {
-                                                        Text(text = "传输同步策略", fontSize = 13.sp, color = Color.Gray) // 💡 灰色字体加大到 13.sp
+                                                        Text(text = "传输策略", fontSize = 13.sp, color = Color.Gray)
                                                         Text(
-                                                            text = if (useUdpSync.value) "UDP + TCP" else "纯 TCP",
+                                                            // 💡 视觉统一：修改“纯TCP”为“TCP”
+                                                            text = if (useUdpSync.value) "UDP + TCP" else "TCP",
                                                             fontSize = 15.sp,
                                                             fontWeight = FontWeight.Bold,
-                                                            color = Color.Black
+                                                            color = cardTextColor
                                                         )
                                                     }
                                                 }
@@ -499,7 +671,7 @@ class MainActivity : ComponentActivity() {
 
                                         Spacer(modifier = Modifier.height(4.dp))
 
-                                        // 发送/接收选择卡片（集成 3D 物理下沉变暗 Bounce 动效）
+                                        // 发送/接收选择卡片
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
                                             horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -507,14 +679,23 @@ class MainActivity : ComponentActivity() {
                                             Card(
                                                 modifier = Modifier
                                                     .weight(1f)
-                                                    // 💡 零延迟响应：3D 物理下沉阻尼弹簧动效
+                                                    .graphicsLayer {
+                                                        alpha = if (hasIpv6) 1.0f else 0.4f
+                                                    }
                                                     .bounceClick {
-                                                        isSenderRole.value = true
-                                                        sessionState.value = SessionState.CONNECTING
-                                                        statusText.value = "请在下方进行连接配对"
+                                                        if (hasIpv6) {
+                                                            isSenderRole.value = true
+                                                            sessionState.value = SessionState.CONNECTING
+                                                            statusText.value = "请在下方进行连接配对"
+                                                        } else {
+                                                            // 弹出阻断提醒
+                                                            android.widget.Toast.makeText(context, "请等待公网 IP 定位成功再试", android.widget.Toast.LENGTH_SHORT).show()
+                                                        }
                                                     },
                                                 shape = RoundedCornerShape(20.dp),
-                                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+                                                colors = CardDefaults.cardColors(
+                                                    containerColor = if (hasIpv6) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                                                )
                                             ) {
                                                 Column(
                                                     modifier = Modifier.padding(16.dp).fillMaxWidth(),
@@ -529,14 +710,22 @@ class MainActivity : ComponentActivity() {
                                             Card(
                                                 modifier = Modifier
                                                     .weight(1f)
-                                                    // 💡 零延迟响应：3D 物理下沉阻尼弹簧动效
+                                                    .graphicsLayer {
+                                                        alpha = if (hasIpv6) 1.0f else 0.4f
+                                                    }
                                                     .bounceClick {
-                                                        isSenderRole.value = false
-                                                        sessionState.value = SessionState.CONNECTING
-                                                        statusText.value = "请在下方进行连接配对"
+                                                        if (hasIpv6) {
+                                                            isSenderRole.value = false
+                                                            sessionState.value = SessionState.CONNECTING
+                                                            statusText.value = "请在下方进行连接配对"
+                                                        } else {
+                                                            android.widget.Toast.makeText(context, "请等待公网 IP 定位成功再试", android.widget.Toast.LENGTH_SHORT).show()
+                                                        }
                                                     },
                                                 shape = RoundedCornerShape(20.dp),
-                                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                                                colors = CardDefaults.cardColors(
+                                                    containerColor = if (hasIpv6) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                                                )
                                             ) {
                                                 Column(
                                                     modifier = Modifier.padding(16.dp).fillMaxWidth(),
@@ -562,8 +751,9 @@ class MainActivity : ComponentActivity() {
                                             textAlign = TextAlign.Start
                                         )
 
+                                        // 我的本端互传码卡片
                                         Card(
-                                            modifier = Modifier.fillMaxWidth().border(1.dp, Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(16.dp)).bounceClick {
+                                            modifier = Modifier.fillMaxWidth().bounceClick {
                                                 if (myCode.value.startsWith("everyshare://")) {
                                                     scope.launch {
                                                         val clipData = ClipData.newPlainText("EveryShare", myCode.value)
@@ -572,13 +762,14 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 }
                                             },
-                                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                                            shape = RoundedCornerShape(16.dp),
+                                            colors = CardDefaults.cardColors(containerColor = cardBg),
                                             elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                         ) {
                                             Column(modifier = Modifier.padding(12.dp)) {
                                                 Text(text = "📱 我的本端互传码 (点击自动复制):", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
                                                 Spacer(modifier = Modifier.height(6.dp))
-                                                Text(text = myCode.value, fontSize = 14.sp)
+                                                Text(text = myCode.value, fontSize = 14.sp, color = cardTextColor)
                                             }
                                         }
 
@@ -625,6 +816,7 @@ class MainActivity : ComponentActivity() {
                                                         setPrompt("将二维码放入框内即可自动扫描")
                                                         setBeepEnabled(true)
                                                         setBarcodeImageEnabled(true)
+                                                        setOrientationLocked(true) // 💡 锁定竖屏！
                                                     }
                                                     scanLauncher.launch(options)
                                                 },
@@ -635,11 +827,13 @@ class MainActivity : ComponentActivity() {
                                         }
 
                                         if (isSenderRole.value) {
+                                            // 选择要发送的文件卡片
                                             Card(
-                                                modifier = Modifier.fillMaxWidth().border(1.dp, Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(16.dp)).bounceClick {
+                                                modifier = Modifier.fillMaxWidth().bounceClick {
                                                     if (!isCachingFile.value) filePickerLauncher.launch("*/*")
                                                 },
-                                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                                shape = RoundedCornerShape(16.dp),
+                                                colors = CardDefaults.cardColors(containerColor = cardBg),
                                                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                             ) {
                                                 Column(modifier = Modifier.padding(12.dp)) {
@@ -647,7 +841,8 @@ class MainActivity : ComponentActivity() {
                                                     Spacer(modifier = Modifier.height(4.dp))
                                                     Text(
                                                         text = if (selectedFileName.value.isEmpty()) "点击选择手机上的任意文件" else "${selectedFileName.value} (${selectedFileSize.value / 1024 / 1024} MB)",
-                                                        fontSize = 14.sp
+                                                        fontSize = 14.sp,
+                                                        color = cardTextColor
                                                     )
                                                 }
                                             }
@@ -671,7 +866,8 @@ class MainActivity : ComponentActivity() {
                                                 statusText.value = if (useUdpSync.value) "正在进行 UDP 时延校准..." else "正在进行 TCP 碰撞打洞..."
                                                 isTransferring.value = true
 
-                                                thread {
+                                                // 💡 保存当前的传输线程引用，用于支持用户随时中断
+                                                val t = thread {
                                                     try {
                                                         val remoteInfo = ConnectionCodeUtil.parseCode(remoteCode.value)
                                                         val puncher = TcpPunchTransfer()
@@ -682,18 +878,18 @@ class MainActivity : ComponentActivity() {
                                                             statusText.value = if (isSenderRole.value) "正在发送: $name" else "正在接收: $name"
                                                         }
 
-                                                        val socket = puncher.connectByPunch(remoteInfo.ip, remoteInfo.port, myPort.value, !isSenderRole.value, useUdpSync.value)
+                                                        val socket = puncher.connectByPunch(remoteInfo.ip, remoteInfo.port, myPort.value, !isSenderRole.value, useUdpSync.value, "speedtest.cn")
                                                         if (socket != null) {
                                                             activeSocket.value = socket
                                                             sessionState.value = SessionState.ACTIVE
-                                                            this@MainActivity.runOnUiThread { statusText.value = "穿透成功！建立长生命周期会话。" }
+                                                            AppLogger.info("穿透成功！建立长生命周期会话。")
 
                                                             if (isSenderRole.value) {
                                                                 val tempCacheFile = File(context.cacheDir, "temp_upload.dat")
                                                                 FileInputStream(tempCacheFile).use { fileInputStream ->
                                                                     puncher.sendFile(socket, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
                                                                 }
-                                                                this@MainActivity.runOnUiThread { statusText.value = "文件发送完成！" }
+                                                                AppLogger.info("文件发送完成！")
                                                             } else {
                                                                 val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(
                                                                     android.os.Environment.DIRECTORY_DOWNLOADS
@@ -703,22 +899,24 @@ class MainActivity : ComponentActivity() {
                                                                 val saveDir = if (everyShareDir.exists()) everyShareDir.absolutePath else downloadDir.absolutePath
 
                                                                 puncher.receiveFile(socket, saveDir, listener)
-                                                                this@MainActivity.runOnUiThread { statusText.value = "🎉 接收成功！已存入公共下载目录" }
+                                                                AppLogger.info("🎉 接收成功！已存入公共下载目录")
                                                             }
                                                         } else {
+                                                            AppLogger.info("❌ 穿透失败，请确认双方同时开启")
                                                             this@MainActivity.runOnUiThread {
-                                                                statusText.value = "❌ 穿透失败，请确认双方同时开启"
                                                                 isTransferring.value = false
                                                             }
                                                         }
                                                     } catch (e: Exception) {
-                                                        Log.e(TAG, "会话执行失败", e)
+                                                        AppLogger.error("会话执行失败", e)
                                                         this@MainActivity.runOnUiThread {
-                                                            statusText.value = "异常中断: ${e.message}"
                                                             isTransferring.value = false
                                                         }
+                                                    } finally {
+                                                        activeTransferThread.value = null
                                                     }
                                                 }
+                                                activeTransferThread.value = t
                                             },
                                             modifier = Modifier.fillMaxWidth().height(50.dp),
                                             enabled = remoteCode.value.isNotBlank() && (!isSenderRole.value || (selectedFileUri.value != null && !isCachingFile.value))
@@ -726,7 +924,7 @@ class MainActivity : ComponentActivity() {
                                             Text(text = "开始连接并进入会话", fontSize = 15.sp)
                                         }
 
-                                        TextButton(onClick = { sessionState.value = SessionState.IDLE }) {
+                                        TextButton(onClick = { cancelActiveTransfer() }) {
                                             Text("返回首页")
                                         }
 
@@ -749,14 +947,16 @@ class MainActivity : ComponentActivity() {
                                             Card(
                                                 modifier = Modifier.fillMaxWidth().bounceClick {
                                                     if (!isCachingFile.value && !isTransferring.value) filePickerLauncher.launch("*/*")
-                                                }
+                                                },
+                                                colors = CardDefaults.cardColors(containerColor = cardBg)
                                             ) {
                                                 Column(modifier = Modifier.padding(12.dp)) {
                                                     Text(text = "📂 选择另一个要发送的文件 (点击浏览):", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
                                                     Spacer(modifier = Modifier.height(4.dp))
                                                     Text(
                                                         text = if (selectedFileName.value.isEmpty()) "点击浏览" else "${selectedFileName.value} (${selectedFileSize.value / 1024 / 1024} MB)",
-                                                        fontSize = 14.sp
+                                                        fontSize = 14.sp,
+                                                        color = cardTextColor
                                                     )
                                                 }
                                             }
@@ -767,7 +967,7 @@ class MainActivity : ComponentActivity() {
                                                     isTransferring.value = true
                                                     statusText.value = "正在通过已建立通道上传..."
 
-                                                    thread {
+                                                    val t = thread {
                                                         try {
                                                             val puncher = TcpPunchTransfer()
                                                             val listener = ProgressListener { name, read, total, speed ->
@@ -779,17 +979,19 @@ class MainActivity : ComponentActivity() {
                                                             FileInputStream(tempCacheFile).use { fileInputStream ->
                                                                 puncher.sendFile(activeSocket.value!!, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
                                                             }
-                                                            this@MainActivity.runOnUiThread { statusText.value = "🎉 文件发送完成！通道继续保持。" }
+                                                            AppLogger.info("🎉 文件发送完成！通道继续保持。")
                                                         } catch (e: Exception) {
-                                                            this@MainActivity.runOnUiThread { statusText.value = "发送出错: ${e.message}" }
+                                                            AppLogger.error("发送出错", e)
                                                         } finally {
                                                             this@MainActivity.runOnUiThread {
                                                                 isTransferring.value = false
                                                                 selectedFileUri.value = null
                                                                 selectedFileName.value = ""
                                                             }
+                                                            activeTransferThread.value = null
                                                         }
                                                     }
+                                                    activeTransferThread.value = t
                                                 },
                                                 modifier = Modifier.fillMaxWidth().height(50.dp),
                                                 enabled = !isTransferring.value && !isCachingFile.value && selectedFileUri.value != null
@@ -808,22 +1010,7 @@ class MainActivity : ComponentActivity() {
                                         Spacer(modifier = Modifier.weight(1f))
 
                                         Button(
-                                            onClick = {
-                                                thread {
-                                                    try {
-                                                        activeSocket.value?.close()
-                                                        activeSocket.value = null
-                                                        this@MainActivity.runOnUiThread {
-                                                            statusText.value = "已主动断开会话"
-                                                            isTransferring.value = false
-                                                            sessionState.value = SessionState.IDLE
-                                                        }
-                                                        resetMyConnectionCode()
-                                                    } catch (e: Exception) {
-                                                        Log.e(TAG, "断开连接失败", e)
-                                                    }
-                                                }
-                                            },
+                                            onClick = { cancelActiveTransfer() },
                                             modifier = Modifier.fillMaxWidth(),
                                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                                         ) {
@@ -831,8 +1018,8 @@ class MainActivity : ComponentActivity() {
                                         }
                                     }
                                 }
-                            } // 💡 这是关闭 if (targetTab == ActiveTab.TRANSFER) 的大括号
-                        } else { // 💡 这是对应的 else (也就是 ActiveTab.SETTINGS)
+                            }
+                        } else {
                             // ==========================================
                             //               「设置」界面
                             // ==========================================
@@ -845,57 +1032,457 @@ class MainActivity : ComponentActivity() {
                                 textAlign = TextAlign.Start
                             )
 
+                            // 设置说明卡片 (去掉 border，更新为硬核点对点科普说明)
                             Card(
-                                modifier = Modifier.fillMaxWidth().border(1.dp, Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(16.dp)),
-                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(containerColor = cardBg),
                                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                             ) {
                                 Column(modifier = Modifier.padding(14.dp)) {
                                     Text(text = "初次使用？", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = MaterialTheme.colorScheme.primary)
                                     Spacer(modifier = Modifier.height(4.dp))
-                                    Text(text = "这是一套去中心化的 P2P 文件传输工具，无任何流量中继开销，数据完全点对点直连传输。", fontSize = 12.sp, color = Color.Gray)
+                                    Text(
+                                        text = "依赖公网 IPv6 实现点对点传输，通过 TCP Simultaneous Open 打开防火墙，FAKE HTTP HEADER 绕过上行限速。\n仅在本地测试有效。还需其他地区，其他运营商，不同环境下测试。",
+                                        fontSize = 12.sp,
+                                        lineHeight = 17.sp,
+                                        color = if (isDark) Color.LightGray else Color.Gray
+                                    )
                                 }
                             }
 
-                            var showAboutDetail by remember { mutableStateOf(false) }
+                            // 声明折叠状态：默认收起（false）
+                            var showAppearanceDetail by remember { mutableStateOf(false) }
+
+                            // 外观卡片 (Settings > Appearance) (已去掉 border)
                             Card(
-                                modifier = Modifier.fillMaxWidth().border(1.dp, Color.LightGray.copy(alpha = 0.2f), RoundedCornerShape(16.dp)).clickable { showAboutDetail = !showAboutDetail },
-                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                modifier = Modifier.fillMaxWidth().clickable { showAppearanceDetail = !showAppearanceDetail },
+                                shape = RoundedCornerShape(20.dp),
+                                colors = CardDefaults.cardColors(containerColor = cardBg),
                                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                             ) {
-                                Column(modifier = Modifier.padding(14.dp)) {
+                                Column(modifier = Modifier.padding(16.dp)) {
                                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                         Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(text = "ℹ️", fontSize = 20.sp)
-                                            Spacer(modifier = Modifier.width(8.dp))
-                                            Text(text = "关于 EveryShare", fontWeight = FontWeight.Bold)
+                                            Text(text = "外观", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = cardTextColor)
                                         }
-                                        Text(text = if (showAboutDetail) "收起" else "展开", fontSize = 11.sp, color = Color.Gray)
+                                        Text(text = if (showAppearanceDetail) "收起" else "展开", fontSize = 11.sp, color = Color.Gray)
                                     }
-                                    if (showAboutDetail) {
-                                        Column(modifier = Modifier.padding(top = 10.dp)) {
-                                            Divider()
-                                            Spacer(modifier = Modifier.height(8.dp))
-                                            Text(text = "版本：v0.3.0-alpha (Beta 1)", fontSize = 12.sp)
-                                            Text(text = "开源协议：MIT License", fontSize = 12.sp)
-                                            Text(text = "说明：本工具纯属学术与极客研究项目，不对使用过程中产生的流量和兼容性问题负责。", fontSize = 11.sp, color = Color.Gray)
-                                            Spacer(modifier = Modifier.height(10.dp))
-                                            Button(
-                                                onClick = {
-                                                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/"))
-                                                    context.startActivity(intent)
-                                                },
-                                                modifier = Modifier.fillMaxWidth()
+
+                                    // 💡 彻底修复割裂感：移除父级 spacedBy，所有分割线和间距完全收纳进 AnimatedVisibility
+                                    AnimatedVisibility(
+                                        visible = showAppearanceDetail,
+                                        enter = expandVertically(animationSpec = tween(300)) + fadeIn(),
+                                        exit = shrinkVertically(animationSpec = tween(300)) + fadeOut()
+                                    ) {
+                                        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Divider(color = Color.LightGray.copy(alpha = 0.2f))
+
+                                            // 1. 动态颜色开关 (Android 12+)
+                                            val isAtLeastS = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
                                             ) {
-                                                Text("访问 GitHub 源码仓库")
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(text = "动态颜色", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = cardTextColor)
+                                                    Text(
+                                                        text = if (isAtLeastS) "跟随系统壁纸取色 (Android 12+)" else "仅支持 Android 12+ 设备",
+                                                        fontSize = 11.sp,
+                                                        color = Color.Gray
+                                                    )
+                                                }
+                                                Switch(
+                                                    checked = useDynamicColor.value && isAtLeastS,
+                                                    onCheckedChange = { onUseDynamicColorChange(it) },
+                                                    enabled = isAtLeastS
+                                                )
+                                            }
+
+                                            // 2. 预设主题色切换
+                                            Column(modifier = Modifier.fillMaxWidth()) {
+                                                Text(text = "配色主题", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = cardTextColor)
+                                                Text(
+                                                    text = if (useDynamicColor.value && isAtLeastS) "关闭动态颜色后生效" else "挑选你喜欢的个性化色调",
+                                                    fontSize = 11.sp,
+                                                    color = Color.Gray
+                                                )
+                                                Spacer(modifier = Modifier.height(12.dp))
+
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    horizontalArrangement = Arrangement.SpaceAround,
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    val isSelectionEnabled = !(useDynamicColor.value && isAtLeastS)
+
+                                                    ThemeIcon(
+                                                        points = 12,
+                                                        innerRatio = 0.84f,
+                                                        isSelected = appTheme.value == AppTheme.LAVENDER && isSelectionEnabled,
+                                                        color = Color(0xFF8F5F6F),
+                                                        enabled = isSelectionEnabled,
+                                                        onClick = { onAppThemeChange(AppTheme.LAVENDER) }
+                                                    )
+
+                                                    ThemeIcon(
+                                                        points = 4,
+                                                        innerRatio = 0.65f,
+                                                        isSelected = appTheme.value == AppTheme.SAGE && isSelectionEnabled,
+                                                        color = Color(0xFF5F8F6F),
+                                                        enabled = isSelectionEnabled,
+                                                        onClick = { onAppThemeChange(AppTheme.SAGE) }
+                                                    )
+
+                                                    ThemeIcon(
+                                                        points = 8,
+                                                        innerRatio = 0.74f,
+                                                        isSelected = appTheme.value == AppTheme.SLATE && isSelectionEnabled,
+                                                        color = Color(0xFF4F6F8F),
+                                                        enabled = isSelectionEnabled,
+                                                        onClick = { onAppThemeChange(AppTheme.SLATE) }
+                                                    )
+
+                                                    ThemeIcon(
+                                                        points = 10,
+                                                        innerRatio = 0.88f,
+                                                        isSelected = appTheme.value == AppTheme.OAT && isSelectionEnabled,
+                                                        color = Color(0xFF8F8A5F),
+                                                        enabled = isSelectionEnabled,
+                                                        onClick = { onAppThemeChange(AppTheme.OAT) }
+                                                    )
+                                                }
+                                            }
+
+                                            Divider(color = Color.LightGray.copy(alpha = 0.2f))
+
+                                            // 3. 深色模式三档切换：采用高精度滑动动画滑块设计 [2]
+                                            Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Text(text = "深色模式", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = cardTextColor)
+
+                                                BoxWithConstraints(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .height(44.dp)
+                                                        .clip(RoundedCornerShape(12.dp))
+                                                        .background(if (isDark) Color(0xFF1E1E1E) else Color.LightGray.copy(alpha = 0.2f))
+                                                        .padding(2.dp)
+                                                ) {
+                                                    val innerWidth = maxWidth - 4.dp
+                                                    val pillWidth = innerWidth / 3
+                                                    val selectedIndex = when (themeMode.value) {
+                                                        ThemeMode.SYSTEM -> 0
+                                                        ThemeMode.LIGHT -> 1
+                                                        ThemeMode.DARK -> 2
+                                                    }
+                                                    val indicatorOffset by animateDpAsState(targetValue = pillWidth * selectedIndex)
+
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .offset(x = indicatorOffset)
+                                                            .width(pillWidth)
+                                                            .fillMaxHeight()
+                                                            .clip(RoundedCornerShape(10.dp))
+                                                            .background(MaterialTheme.colorScheme.primary)
+                                                    )
+
+                                                    Row(modifier = Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+                                                        ThemeModePill(
+                                                            text = "跟随系统",
+                                                            isSelected = themeMode.value == ThemeMode.SYSTEM,
+                                                            onClick = { onThemeModeChange(ThemeMode.SYSTEM) },
+                                                            modifier = Modifier.weight(1f)
+                                                        )
+                                                        ThemeModePill(
+                                                            text = "浅色",
+                                                            isSelected = themeMode.value == ThemeMode.LIGHT,
+                                                            onClick = { onThemeModeChange(ThemeMode.LIGHT) },
+                                                            modifier = Modifier.weight(1f)
+                                                        )
+                                                        ThemeModePill(
+                                                            text = "深色",
+                                                            isSelected = themeMode.value == ThemeMode.DARK,
+                                                            onClick = { onThemeModeChange(ThemeMode.DARK) },
+                                                            modifier = Modifier.weight(1f)
+                                                        )
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        } // 💡 这是关闭 else (Settings) 的大括号
-                    } // 💡 这是关闭 Column (C_SUB) 的大括号
-                } // 💡 这是关闭 AnimatedContent 的大括号
+
+                            // 💡 传输策略设置卡片 (M3 标准下拉源选择器风格) (已去掉所有边框与 spacedBy 割裂感) [2]
+                            var showStrategyDetail by remember { mutableStateOf(false) }
+                            Card(
+                                modifier = Modifier.fillMaxWidth().clickable { showStrategyDetail = !showStrategyDetail },
+                                shape = RoundedCornerShape(20.dp),
+                                colors = CardColors(containerColor = cardBg, contentColor = cardTextColor, disabledContainerColor = cardBg, disabledContentColor = cardTextColor),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(16.dp)) {
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(text = "传输策略", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = cardTextColor)
+                                        }
+                                        Text(text = if (showStrategyDetail) "收起" else "展开", fontSize = 11.sp, color = Color.Gray)
+                                    }
+
+                                    AnimatedVisibility(
+                                        visible = showStrategyDetail,
+                                        enter = expandVertically(animationSpec = tween(300)) + fadeIn(),
+                                        exit = shrinkVertically(animationSpec = tween(300)) + fadeOut()
+                                    ) {
+                                        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Divider(color = Color.LightGray.copy(alpha = 0.2f))
+
+                                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                Text(text = "设置传输策略，默认为 UDP + TCP", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = cardTextColor)
+                                                Text(text = "UDP + TCP：先打通 UDP 防火墙，两端通过 UDP 校准时间，同时向对方发 TCP 包", fontSize = 10.sp, lineHeight = 14.sp, color = Color.Gray)
+                                                Text(text = "TCP：尝试直接向对方发 TCP 包打通两端 TCP 防火墙", fontSize = 10.sp, lineHeight = 14.sp, color = Color.Gray)
+                                            }
+
+                                            // 💡 彻底修复：点击输入框整行任意位置自动触发下拉，而不需要点右侧小箭头 [2]
+                                            var dropdownExpanded by remember { mutableStateOf(false) }
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable { dropdownExpanded = true } // 💡 整行点击！
+                                            ) {
+                                                OutlinedTextField(
+                                                    value = if (useUdpSync.value) "UDP + TCP (推荐)" else "TCP",
+                                                    onValueChange = {},
+                                                    readOnly = true,
+                                                    enabled = false, // 💡 关闭本身交互，把点击权完全让渡给外层 Box
+                                                    label = { Text("传输策略") },
+                                                    trailingIcon = {
+                                                        Icon(
+                                                            imageVector = if (dropdownExpanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                                                            contentDescription = null,
+                                                            tint = cardTextColor
+                                                        )
+                                                    },
+                                                    colors = OutlinedTextFieldDefaults.colors(
+                                                        disabledTextColor = cardTextColor,
+                                                        disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        disabledBorderColor = MaterialTheme.colorScheme.outline,
+                                                        disabledContainerColor = Color.Transparent
+                                                    ),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                                DropdownMenu(
+                                                    expanded = dropdownExpanded,
+                                                    onDismissRequest = { dropdownExpanded = false },
+                                                    modifier = Modifier.fillMaxWidth(0.9f).background(cardBg)
+                                                ) {
+                                                    DropdownMenuItem(
+                                                        text = { Text("UDP + TCP (推荐)", color = cardTextColor) },
+                                                        onClick = {
+                                                            onUseUdpSyncChange(true)
+                                                            dropdownExpanded = false
+                                                        }
+                                                    )
+                                                    DropdownMenuItem(
+                                                        text = { Text("TCP", color = cardTextColor) },
+                                                        onClick = {
+                                                            onUseUdpSyncChange(false)
+                                                            dropdownExpanded = false
+                                                        }
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 💡 FAKE HTTP HEADER 混淆设置卡片 [2.1.2]
+                            var showFakeHttpDetail by remember { mutableStateOf(false) }
+                            Card(
+                                modifier = Modifier.fillMaxWidth().clickable { showFakeHttpDetail = !showFakeHttpDetail },
+                                shape = RoundedCornerShape(20.dp),
+                                colors = CardColors(containerColor = cardBg, contentColor = cardTextColor, disabledContainerColor = cardBg, disabledContentColor = cardTextColor),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(16.dp)) {
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(text = "FAKE HTTP HEADER", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = cardTextColor)
+                                        }
+                                        Text(text = if (showFakeHttpDetail) "收起" else "展开", fontSize = 11.sp, color = Color.Gray)
+                                    }
+
+                                    AnimatedVisibility(
+                                        visible = showFakeHttpDetail,
+                                        enter = expandVertically(animationSpec = tween(300)) + fadeIn(),
+                                        exit = shrinkVertically(animationSpec = tween(300)) + fadeOut()
+                                    ) {
+                                        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Divider(color = Color.LightGray.copy(alpha = 0.2f))
+
+                                            Text(text = "用于解开运营商限速的域名，默认为 speedtest.cn", fontSize = 11.sp, color = Color.Gray)
+
+                                            // 💡 彻底修复：点击输入框整行任意位置自动触发下拉 [2]
+                                            var hHeaderExpanded by remember { mutableStateOf(false) }
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clickable { hHeaderExpanded = true } // 💡 整行点击！
+                                            ) {
+                                                OutlinedTextField(
+                                                    value = fakeHttpOption.value,
+                                                    onValueChange = {},
+                                                    readOnly = true,
+                                                    enabled = false, // 💡 关闭本身交互，把点击权完全让渡给外层 Box
+                                                    label = { Text("DPI 伪装域名") },
+                                                    trailingIcon = {
+                                                        Icon(
+                                                            imageVector = if (hHeaderExpanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
+                                                            contentDescription = null,
+                                                            tint = cardTextColor
+                                                        )
+                                                    },
+                                                    colors = OutlinedTextFieldDefaults.colors(
+                                                        disabledTextColor = cardTextColor,
+                                                        disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                        disabledBorderColor = MaterialTheme.colorScheme.outline,
+                                                        disabledContainerColor = Color.Transparent
+                                                    ),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                                DropdownMenu(
+                                                    expanded = hHeaderExpanded,
+                                                    onDismissRequest = { hHeaderExpanded = false },
+                                                    modifier = Modifier.fillMaxWidth(0.9f).background(cardBg)
+                                                ) {
+                                                    DropdownMenuItem(
+                                                        text = { Text("speedtest.cn", color = cardTextColor) },
+                                                        onClick = {
+                                                            onFakeHttpOptionChange("speedtest.cn")
+                                                            hHeaderExpanded = false
+                                                        }
+                                                    )
+                                                    DropdownMenuItem(
+                                                        text = { Text("自定义", color = cardTextColor) },
+                                                        onClick = {
+                                                            onFakeHttpOptionChange("自定义")
+                                                            hHeaderExpanded = false
+                                                        }
+                                                    )
+                                                }
+                                            }
+
+                                            // 💡 只有当用户选择“自定义”时，才优雅渐显出自定义输入框
+                                            AnimatedVisibility(
+                                                visible = fakeHttpOption.value == "自定义",
+                                                enter = expandVertically(animationSpec = tween(250)) + fadeIn(),
+                                                exit = shrinkVertically(animationSpec = tween(250)) + fadeOut()
+                                            ) {
+                                                OutlinedTextField(
+                                                    value = customFakeHttpHost.value,
+                                                    onValueChange = { onCustomFakeHttpHostChange(it) },
+                                                    label = { Text("自定义混淆 Host (例: update.microsoft.com)") },
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            var showAboutDetail by remember { mutableStateOf(false) }
+                            // 关于 EveryShare 卡片：完全按你的最新需求与截图重构 (已去掉所有边框与 spacedBy 割裂感)
+                            Card(
+                                modifier = Modifier.fillMaxWidth().clickable { showAboutDetail = !showAboutDetail },
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(containerColor = cardBg),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(14.dp)) {
+                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(text = "关于 EveryShare", fontWeight = FontWeight.Bold, color = cardTextColor)
+                                        }
+                                        Text(text = if (showAboutDetail) "收起" else "展开", fontSize = 11.sp, color = Color.Gray)
+                                    }
+
+                                    // 打开关闭加入优雅平滑伸缩折叠动画，拒绝生硬卡顿！
+                                    AnimatedVisibility(
+                                        visible = showAboutDetail,
+                                        enter = expandVertically(animationSpec = tween(300)) + fadeIn(),
+                                        exit = shrinkVertically(animationSpec = tween(300)) + fadeOut()
+                                    ) {
+                                        Column {
+                                            Spacer(modifier = Modifier.height(10.dp))
+                                            Divider(color = Color.LightGray.copy(alpha = 0.2f))
+                                            Spacer(modifier = Modifier.height(14.dp))
+
+                                            // 100% 还原关于盒子布局
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .clip(RoundedCornerShape(18.dp))
+                                                    .background(if (isDark) Color(0xFF1E1E1E) else Color.LightGray.copy(alpha = 0.15f))
+                                                    .padding(16.dp)
+                                            ) {
+                                                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                                    Text(text = "关于", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = cardTextColor)
+
+                                                    Row(
+                                                        modifier = Modifier.fillMaxWidth(),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
+                                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                                            // 💡 硬件级物理裁剪的圆形本地头像（自适应读取 app/src/main/res/drawable/avatar.png） [1]
+                                                            Image(
+                                                                painter = painterResource(id = R.drawable.avatar),
+                                                                contentDescription = "Avatar",
+                                                                modifier = Modifier
+                                                                    .size(48.dp)
+                                                                    .clip(CircleShape)
+                                                            )
+
+                                                            Spacer(modifier = Modifier.width(12.dp))
+
+                                                            Column {
+                                                                Text(text = "BlackTea", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = MaterialTheme.colorScheme.primary)
+                                                                Text(text = "开发者", fontSize = 12.sp, color = Color.Gray)
+                                                            }
+                                                        }
+
+                                                        // 右侧外链分享图标 [1]
+                                                        IconButton(onClick = {
+                                                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/BlackTeaOff/EveryShare-Android"))
+                                                            context.startActivity(intent)
+                                                        }) {
+                                                            Icon(
+                                                                imageVector = Icons.Default.Share,
+                                                                contentDescription = "GitHub Repo",
+                                                                tint = cardTextColor
+                                                            )
+                                                        }
+                                                    }
+
+                                                    // 💡 底部署名与版本 (版本对齐为 v0.1.0-alpha，作者变更为 Powered By Gemini) [3]
+                                                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                        Text(text = "版本：v0.1.0-alpha", fontSize = 12.sp, color = cardTextColor)
+                                                        Text(text = "Powered By Gemini", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = cardTextColor)
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -909,17 +1496,21 @@ class MainActivity : ComponentActivity() {
                 }
 
                 AnimatedVisibility(visible = showLogs.value) {
-                    // 💡 去掉内阴影，白底黑字扁平极细灰色边框，并使用 SelectionContainer 支持复制
+                    // 运行日志控制台也深度适配深浅色模式：深色模式自动变为护眼深黑控制台 #151515
+                    val consoleBg = if (isDark) Color(0xFF151515) else Color(0xFFF9F9F9)
+                    val consoleBorder = if (isDark) Color.DarkGray.copy(alpha = 0.4f) else Color.LightGray.copy(alpha = 0.4f)
+                    val consoleTextColor = if (isDark) Color.LightGray else Color.Black
+
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(135.dp)
                             .clip(RoundedCornerShape(14.dp))
-                            .background(Color.White)
-                            .border(1.dp, Color.LightGray.copy(alpha = 0.4f), RoundedCornerShape(14.dp))
+                            .background(consoleBg)
+                            .border(1.dp, consoleBorder, RoundedCornerShape(14.dp))
                             .padding(8.dp)
                     ) {
-                        SelectionContainer { // 💡 支持文本光标选择复制！
+                        SelectionContainer {
                             LazyColumn(
                                 state = logListState,
                                 modifier = Modifier.fillMaxSize(),
@@ -928,7 +1519,7 @@ class MainActivity : ComponentActivity() {
                                 items(logList) { logLine ->
                                     Text(
                                         text = logLine,
-                                        color = if (logLine.contains("[ERROR]")) Color.Red else Color.Black,
+                                        color = if (logLine.contains("[ERROR]")) Color.Red else consoleTextColor,
                                         fontSize = 10.sp,
                                         fontFamily = FontFamily.Monospace
                                     )
@@ -937,11 +1528,14 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
-            } // 💡 这是关闭主布局 Column (C_MAIN) 的大括号
+            }
 
             // 悬浮药丸底部导航栏
             val selectedIndex = if (currentTab.value == ActiveTab.TRANSFER) 0 else 1
-            val indicatorOffset by animateDpAsState(targetValue = if (selectedIndex == 0) 4.dp else 92.dp)
+            // 数学对称性优化：180.dp 大药丸除去左右 4.dp padding 剩下 172.dp 内部区域
+            // 每个 Tab 点击区和背景滑动滑块宽度精确设置为：172 / 2 = 86.dp
+            // 左边时偏移 0.dp，右边时精准偏移 86.dp，彻底根治滑块紧贴右边缘的问题 [2]
+            val indicatorOffset by animateDpAsState(targetValue = if (selectedIndex == 0) 0.dp else 86.dp)
 
             Box(
                 modifier = Modifier
@@ -951,15 +1545,15 @@ class MainActivity : ComponentActivity() {
                     .width(180.dp)
                     .height(52.dp)
                     .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f))
+                    // 悬浮药丸背景自适应：深色背景为 #242424，浅色为 standard 磨砂玻璃色
+                    .background(if (isDark) Color(0xFF242424).copy(alpha = 0.95f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.95f))
                     .padding(4.dp),
                 contentAlignment = Alignment.CenterStart
             ) {
-                // 背景滑动小药丸
                 Box(
                     modifier = Modifier
                         .offset(x = indicatorOffset)
-                        .width(84.dp)
+                        .width(86.dp) // 84.dp 改为 86.dp 精确对接
                         .fillMaxHeight()
                         .clip(CircleShape)
                         .background(MaterialTheme.colorScheme.primary)
@@ -974,7 +1568,7 @@ class MainActivity : ComponentActivity() {
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
-                            .width(80.dp)
+                            .weight(1f) // width(80.dp) 改为 weight(1f) 保证宽度为精确的 86.dp
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
@@ -993,7 +1587,7 @@ class MainActivity : ComponentActivity() {
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
-                            .width(80.dp)
+                            .weight(1f) // width(80.dp) 改为 weight(1f) 保证宽度为精确的 86.dp
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
@@ -1008,9 +1602,9 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                 }
-            } // 💡 这是关闭底部导航栏 Box 的大括号
-        } // 💡 这是关闭整个 EveryShareScreen 顶层 Box (B_ROOT) 的大括号
-    } // 💡 这是关闭 EveryShareScreen 方法本身的大括号
+            }
+        }
+    }
 
     private fun getFileMetadata(context: Context, uri: Uri): Pair<String, Long> {
         var name = "unknown_file"
@@ -1033,7 +1627,6 @@ class MainActivity : ComponentActivity() {
             val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
             for (x in 0 until size) {
                 for (y in 0 until size) {
-                    // 💡 显式指定包名，彻底解决类名冲突 [1]
                     bitmap.setPixel(x, y, if (bitMatrix.get(x, y)) AndroidColor.BLACK else AndroidColor.WHITE)
                 }
             }
@@ -1044,16 +1637,100 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// 💡 极致 3D 物理下沉变暗动效 (3D Parallax/Tilt Card Effect)
-// 手指按在哪个角，卡片就朝哪个方向发生 3D 偏转，松手时在弹簧阻尼下优雅、Q弹回弹
-// 💡 核心优化：采用全新 getGestureState 手势机制，解决 Scroll 容器下的 Tap 冲突，确保按压 100% 极速响应！
-inline fun Modifier.bounceClick(crossinline onClick: () -> Unit): Modifier = composed {
+// 💡 异形主题配色图标手绘 Canvas 组件 (支持无极缩放与原生 M3 变色)
+@Composable
+fun ThemeIcon(
+    points: Int,
+    innerRatio: Float,
+    isSelected: Boolean,
+    color: Color,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .size(54.dp)
+            .graphicsLayer { alpha = if (enabled) 1.0f else 0.4f }
+            .bounceClick { if (enabled) onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(modifier = Modifier.size(40.dp)) {
+            val path = Path()
+            val center = Offset(size.width / 2, size.height / 2)
+            val outerRadius = size.minDimension / 2
+            val innerRadius = outerRadius * innerRatio
+            val angleStep = Math.PI / points
+
+            for (i in 0 until 2 * points) {
+                val r = if (i % 2 == 0) outerRadius else innerRadius
+                val angle = i * angleStep
+                val x = (center.x + r * Math.cos(angle)).toFloat()
+                val y = (center.y + r * Math.sin(angle)).toFloat()
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            path.close()
+            drawPath(path = path, color = color)
+
+            // 如果被选中，在中心绘制一个精致的白色对勾
+            if (isSelected) {
+                val strokeWidth = 3.dp.toPx()
+                val checkPath = Path().apply {
+                    moveTo(size.width * 0.35f, size.height * 0.5f)
+                    lineTo(size.width * 0.47f, size.height * 0.62f)
+                    lineTo(size.width * 0.68f, size.height * 0.38f)
+                }
+                drawPath(
+                    path = checkPath,
+                    color = Color.White,
+                    style = Stroke(
+                        width = strokeWidth,
+                        cap = StrokeCap.Round,
+                        join = StrokeJoin.Round
+                    )
+                )
+            }
+        }
+    }
+}
+
+// 💡 扁平分栏滑动小药丸组件 (Settings > Dark Mode)
+@Composable
+fun ThemeModePill(
+    text: String,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null
+            ) { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = text,
+            color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = FontWeight.Bold,
+            fontSize = 11.sp
+        )
+    }
+}
+
+
+// 极致 3D 物理下沉变暗动效 (已彻底修复 `pointerInput(Unit)` 闭包捕获历史旧状态的经典 Bug)
+fun Modifier.bounceClick(onClick: () -> Unit): Modifier = composed {
     var rotationX by remember { mutableStateOf(0f) }
     var rotationY by remember { mutableStateOf(0f) }
     var scale by remember { mutableStateOf(1f) }
     var alpha by remember { mutableStateOf(1f) }
 
-    // 💡 物理阻尼弹簧效果
+    // 💡 解决由 pointerInput(Unit) 导致 lambda 闭包捕获历史旧状态的经典 Bug
+    val currentOnClick = rememberUpdatedState(onClick)
+
     val animRotationX by animateFloatAsState(
         targetValue = rotationX,
         animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow)
@@ -1072,18 +1749,16 @@ inline fun Modifier.bounceClick(crossinline onClick: () -> Unit): Modifier = com
     )
 
     this.pointerInput(Unit) {
-        // 💡 1. 核心修复：在进入 detectTapGestures 之前，先把 PointerInputScope 的 size 保存为局部变量
         val localSize = this.size
 
         detectTapGestures(
             onPress = { offset ->
-                val centerX = localSize.component1() / 2f  // 💡 2. 使用 localSize.component1()
-                val centerY = localSize.component2() / 2f  // 💡 3. 使用 localSize.component2()
+                val centerX = localSize.component1() / 2f
+                val centerY = localSize.component2() / 2f
 
                 val deltaX = (offset.x - centerX) / centerX
                 val deltaY = (offset.y - centerY) / centerY
 
-                // 3D 偏转算法
                 rotationY = deltaX * 12f
                 rotationX = -deltaY * 12f
                 scale = 0.95f
@@ -1098,7 +1773,7 @@ inline fun Modifier.bounceClick(crossinline onClick: () -> Unit): Modifier = com
                 scale = 1f
                 alpha = 1f
             },
-            onTap = { onClick() }
+            onTap = { currentOnClick.value() } // 💡 调用最新状态的 Lambda
         )
     }.graphicsLayer {
         this.rotationX = animRotationX
@@ -1106,6 +1781,6 @@ inline fun Modifier.bounceClick(crossinline onClick: () -> Unit): Modifier = com
         this.scaleX = animScale
         this.scaleY = animScale
         this.alpha = animAlpha
-        this.cameraDistance = 16f * density // 💡 3D 深度透视
+        this.cameraDistance = 16f * density
     }
 }

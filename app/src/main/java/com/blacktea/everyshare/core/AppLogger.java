@@ -17,7 +17,8 @@ public class AppLogger {
         String formatted = format;
         for (Object arg : arguments) {
             if (arg != null) {
-                formatted = formatted.replaceFirst("\\{\\}", arg.toString());
+                // 💡 使用 Matcher.quoteReplacement 保护参数，防止特殊字符（如 $ 和 \）导致正则解析崩溃
+                formatted = formatted.replaceFirst("\\{\\}", java.util.regex.Matcher.quoteReplacement(arg.toString()));
             }
         }
         append("[INFO] " + formatted);

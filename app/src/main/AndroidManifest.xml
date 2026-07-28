@@ -25,6 +25,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- 💡 放在 <application> 标签内部的最下方 -->
+        <!-- 强制覆盖 Zxing 的扫码 Activity 确保在所有手机上都是竖屏，彻底解决横屏闪烁 Bug -->
+        <activity
+            android:name="com.journeyapps.barcodescanner.CaptureActivity"
+            android:screenOrientation="portrait"
+            tools:replace="android:screenOrientation" />
     </application>
 
 </manifest>

@@ -85,18 +85,17 @@ public class TcpPunchTransfer {
         return list;
     }
 
-    private double alignTimeByUdp(String remoteIp, int remotePort, int localPort, boolean isMaster) {
+    private double alignTimeByUdpWithIp(InetAddress localIp, String remoteIp, int remotePort, int localPort, boolean isMaster) {
         AppLogger.info("[UDP] Starting sync and time alignment...");
         double slaveWaitTimeMs = 0;
 
         try (DatagramSocket udpSocket = new DatagramSocket(null)) {
             udpSocket.setReuseAddress(true);
-
-            InetAddress localIp = getActivePublicIpv6();
-            if (localIp == null) return 0; // 💡 没公网 IP 直接退出
-
+            // 💡 直接使用传入的 localIp，消除了底层的二次 HTTP 请求
             udpSocket.bind(new InetSocketAddress(localIp, localPort));
             udpSocket.setSoTimeout(300);
+
+            // ... 后面原有的握手和 RTT 测算代码完全保持不变 ...
 
             InetAddress remoteAddress = InetAddress.getByName(remoteIp);
             byte[] sendBuf = "UDP_HELLO".getBytes(StandardCharsets.UTF_8);
@@ -192,9 +191,23 @@ public class TcpPunchTransfer {
         return 0;
     }
 
-    public Socket connectByPunch(String remoteIp, int remotePort, int localPort, boolean isMaster, boolean useUdpSync) {
+    public Socket connectByPunch(String remoteIp, int remotePort, int localPort, boolean isMaster, boolean useUdpSync, String fakeHttpHost) {
+        // 1. 提前获取好物理 IP 并缓存，后续不再发起任何阻塞网络查询
+        InetAddress localIp = getActivePublicIpv6();
+        if (localIp == null) {
+            try {
+                localIp = getLocalPhysicalIPv6();
+            } catch (Exception ignored) {}
+        }
+
+        if (localIp == null) {
+            AppLogger.info("[ERROR] 无法启动穿透：未找到本机有效的公网 IPv6 地址");
+            return null;
+        }
+
         if (useUdpSync) {
-            double waitTimeMs = alignTimeByUdp(remoteIp, remotePort, localPort, isMaster);
+            // 💡 核心修改：将已经拿到的 localIp 传入 UDP 校准方法中，彻底对齐参数
+            double waitTimeMs = alignTimeByUdpWithIp(localIp, remoteIp, remotePort, localPort, isMaster);
             if (waitTimeMs > 0) {
                 try { Thread.sleep((long) waitTimeMs); } catch (InterruptedException ignored) {}
             }
@@ -207,14 +220,13 @@ public class TcpPunchTransfer {
 
         int attempt = 1;
         long timeoutMs = 800;
-        InetAddress localIp;
-        localIp = getActivePublicIpv6();
-        if (localIp == null) {
-            log.error("Failed to retrieve public IPv6");
-            return null;
-        }
 
         while (true) {
+            if (Thread.currentThread().isInterrupted()) {
+                AppLogger.info("[TCP] 用户主动取消了连接，正在退出碰撞...");
+                return null;
+            }
+
             Socket socket = new Socket();
             try {
                 socket.setSendBufferSize(1500 * 1024);
@@ -229,10 +241,11 @@ public class TcpPunchTransfer {
                 OutputStream os = socket.getOutputStream();
                 InputStream is = socket.getInputStream();
 
-                os.write(FAKE_HTTP_HEADER.getBytes(StandardCharsets.UTF_8));
+                String fakeHeader = "GET / HTTP/1.1\r\nHost: " + fakeHttpHost + "\r\n\r\n";
+                os.write(fakeHeader.getBytes(StandardCharsets.UTF_8));
                 os.flush();
 
-                int targetLength = FAKE_HTTP_HEADER.length();
+                int targetLength = fakeHeader.length();
                 byte[] cleanBuffer = new byte[targetLength];
                 int totalRead = 0;
                 while (totalRead < targetLength) {
@@ -250,7 +263,10 @@ public class TcpPunchTransfer {
                 attempt++;
                 try {
                     Thread.sleep(50);
-                } catch (InterruptedException ignored) {}
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
             }
         }
     }
