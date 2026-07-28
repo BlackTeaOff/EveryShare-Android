@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color as AndroidColor
 import android.net.ConnectivityManager
 import android.net.Network
@@ -22,6 +23,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
@@ -47,15 +49,23 @@ import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.LoadingIndicator
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -78,14 +88,20 @@ import androidx.core.view.WindowCompat
 import com.blacktea.everyshare.core.AppLogger
 import com.blacktea.everyshare.core.ConnectionCodeUtil
 import com.blacktea.everyshare.core.ProgressListener
+import com.blacktea.everyshare.core.StatusListener
 import com.blacktea.everyshare.core.TcpPunchTransfer
 import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.RGBLuminanceSource
+import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import java.io.File
 import java.io.FileInputStream
 import java.net.Socket
+import java.nio.charset.StandardCharsets
 import kotlin.concurrent.thread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -118,9 +134,10 @@ class MainActivity : ComponentActivity() {
         windowInsetsController.isAppearanceLightStatusBars = true
 
         setContent {
+            // 💡 1. 核心修复：必须在 setContent 的第一行，先获取 Compose 的 Context 实例 [1.2.6]
             val context = LocalContext.current
 
-            // 💡 1. 引入 SharedPreferences 存储，防止设置在 App 退出后重置 [1]
+            // 💡 2. 引入 SharedPreferences 存储，保存项目外观配置 [1]
             val prefs = remember { context.getSharedPreferences("everyshare_prefs", Context.MODE_PRIVATE) }
 
             var useDynamicColor by rememberSaveable {
@@ -142,7 +159,7 @@ class MainActivity : ComponentActivity() {
                 mutableStateOf(prefs.getString("custom_fake_http_host", "") ?: "")
             }
 
-            // 💡 2. 动态计算当前是否应该使用深色主题
+            // 3. 动态计算当前是否应该使用深色主题
             val systemInDark = isSystemInDarkTheme()
             val isDark = when (themeMode) {
                 ThemeMode.SYSTEM -> systemInDark
@@ -150,7 +167,7 @@ class MainActivity : ComponentActivity() {
                 ThemeMode.DARK -> true
             }
 
-            // 💡 3. 构建当前的主题色色板
+            // 4. 构建当前的主题色色板
             val rawColorScheme = when {
                 useDynamicColor && isDark && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicDarkColorScheme(context)
                 useDynamicColor && !isDark && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicLightColorScheme(context)
@@ -204,6 +221,25 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun getLightPresetScheme(theme: AppTheme): ColorScheme {
+        return when (theme) {
+            AppTheme.LAVENDER -> lightColorScheme(primary = Color(0xFF8F5F6F), primaryContainer = Color(0xFFECE2E5), background = Color(0xFFF7F2F4), surface = Color.White)
+            AppTheme.SAGE -> lightColorScheme(primary = Color(0xFF5F8F6F), primaryContainer = Color(0xFFE2ECE9), background = Color(0xFFF2F7F4), surface = Color.White)
+            AppTheme.SLATE -> lightColorScheme(primary = Color(0xFF4F6F8F), primaryContainer = Color(0xFFD9E2EC), background = Color(0xFFF0F4F8), surface = Color.White)
+            AppTheme.OAT -> lightColorScheme(primary = Color(0xFF8F8A5F), primaryContainer = Color(0xFFECEBE2), background = Color(0xFFF7F7F2), surface = Color.White)
+        }
+    }
+
+    private fun getDarkPresetScheme(theme: AppTheme): ColorScheme {
+        return when (theme) {
+            AppTheme.LAVENDER -> darkColorScheme(primary = Color(0xFFF9D1DC), primaryContainer = Color(0xFF4F2A38), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+            AppTheme.SAGE -> darkColorScheme(primary = Color(0xFFD1F9D4), primaryContainer = Color(0xFF2A4F32), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+            AppTheme.SLATE -> darkColorScheme(primary = Color(0xFFD1E8F9), primaryContainer = Color(0xFF2A3F4F), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+            AppTheme.OAT -> darkColorScheme(primary = Color(0xFFF9F7D1), primaryContainer = Color(0xFF4F4B2A), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+        }
+    }
+
+    // 💡 放在 MainActivity 类内部，getDarkPresetScheme 的下方
     @Composable
     private fun animateColorScheme(target: ColorScheme): ColorScheme {
         return ColorScheme(
@@ -239,21 +275,25 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun getLightPresetScheme(theme: AppTheme): ColorScheme {
-        return when (theme) {
-            AppTheme.LAVENDER -> lightColorScheme(primary = Color(0xFF8F5F6F), primaryContainer = Color(0xFFECE2E5), background = Color(0xFFF7F2F4), surface = Color.White)
-            AppTheme.SAGE -> lightColorScheme(primary = Color(0xFF5F8F6F), primaryContainer = Color(0xFFE2ECE9), background = Color(0xFFF2F7F4), surface = Color.White)
-            AppTheme.SLATE -> lightColorScheme(primary = Color(0xFF4F6F8F), primaryContainer = Color(0xFFD9E2EC), background = Color(0xFFF0F4F8), surface = Color.White)
-            AppTheme.OAT -> lightColorScheme(primary = Color(0xFF8F8A5F), primaryContainer = Color(0xFFECEBE2), background = Color(0xFFF7F7F2), surface = Color.White)
-        }
-    }
+    // 💡 扫码解析方法
+    private fun decodeQrFromUri(context: Context, uri: Uri): String? {
+        return try {
+            context.contentResolver.openInputStream(uri).use { inputStream ->
+                val bitmap = BitmapFactory.decodeStream(inputStream)
+                val width = bitmap.width
+                val height = bitmap.height
+                val pixels = IntArray(width * height)
+                bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
 
-    private fun getDarkPresetScheme(theme: AppTheme): ColorScheme {
-        return when (theme) {
-            AppTheme.LAVENDER -> darkColorScheme(primary = Color(0xFFF9D1DC), primaryContainer = Color(0xFF4F2A38), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
-            AppTheme.SAGE -> darkColorScheme(primary = Color(0xFFD1F9D4), primaryContainer = Color(0xFF2A4F32), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
-            AppTheme.SLATE -> darkColorScheme(primary = Color(0xFFD1E8F9), primaryContainer = Color(0xFF2A3F4F), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
-            AppTheme.OAT -> darkColorScheme(primary = Color(0xFFF9F7D1), primaryContainer = Color(0xFF4F4B2A), background = Color(0xFF1C1B1D), surface = Color(0xFF242424))
+                val source = RGBLuminanceSource(width, height, pixels)
+                val binaryBitmap = BinaryBitmap(HybridBinarizer(source))
+                val reader = MultiFormatReader()
+                val result = reader.decode(binaryBitmap)
+                result.text
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "从相册解析二维码失败", e)
+            null
         }
     }
 
@@ -294,7 +334,7 @@ class MainActivity : ComponentActivity() {
         val currentSpeed = remember { mutableStateOf(0.0) }
         val isTransferring = remember { mutableStateOf(false) }
 
-        val showQrCode = remember { mutableStateOf(false) }
+        val showQrCode = rememberSaveable { mutableStateOf(false) } // 💡 记住 3D 翻转状态
         val showLogs = remember { mutableStateOf(false) }
         val logList = remember { mutableStateListOf<String>() }
         val logListState = rememberLazyListState()
@@ -303,7 +343,16 @@ class MainActivity : ComponentActivity() {
         val activeTransferThread = remember { mutableStateOf<Thread?>(null) }
         var resetIpJob by remember { mutableStateOf<Job?>(null) }
 
-        // 文件选择相关状态
+        // 💡 1. 定义连接打洞阶段的确定进度状态，-1.0f 代表未接通（转圈），1.0f 代表成功
+        var connectionProgress by remember { mutableStateOf(-1.0f) }
+
+        // 💡 2. 状态：控制双 5G 退出确认弹窗是否显示 [1]
+        var showExitDialog by remember { mutableStateOf(false) }
+
+        // 📂 二维码 Bitmap 高速异步缓存，彻底消除 3D 旋转时的 JIT 计算卡顿 [1.1.2]
+        var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
+        // 文件选择相关状态 (已转移至此)
         val selectedFileUri = remember { mutableStateOf<Uri?>(null) }
         val selectedFileName = remember { mutableStateOf("") }
         val selectedFileSize = remember { mutableStateOf(0L) }
@@ -325,13 +374,54 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 💡 重置连接码 (加上协程 delay，防止冷启动和界面返回时抢占 CPU 造成 UI 卡顿)
+        // 💡 异步生成二维码并进行内存级预缓存，解除 3D 旋转过程中的计算死锁 [1.1.2]
+        LaunchedEffect(myCode.value) {
+            if (myCode.value.startsWith("everyshare://")) {
+                withContext(Dispatchers.IO) {
+                    val bitmap = this@MainActivity.generateQrCode(myCode.value, 400)
+                    withContext(Dispatchers.Main) {
+                        qrBitmap = bitmap
+                        Log.i(TAG, "二维码已完成异步预缓存")
+                    }
+                }
+            }
+        }
+
+        // 💡 从相册选择并解析二维码 (调用外层解析方法)
+        val galleryLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.GetContent()
+        ) { uri: Uri? ->
+            if (uri != null) {
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val parsed = this@MainActivity.decodeQrFromUri(context, uri)
+                        if (parsed != null && parsed.startsWith("everyshare://")) {
+                            withContext(Dispatchers.Main) {
+                                remoteCode.value = parsed
+                                AppLogger.info("Success: QR decoded from photo gallery.")
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                android.widget.Toast.makeText(context, "未能在图片中找到有效的 EveryShare 二维码", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            android.widget.Toast.makeText(context, "相册解析出错: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+        }
+
+        // 💡 重置连接码 (已被放置在最上方，彻底防止编译未找到引用的 Bug) (加上协程 delay，防止冷启动和界面返回时抢占 CPU 造成 UI 卡顿)
         fun resetMyConnectionCode() {
             resetIpJob?.cancel()
             myIpv6Text.value = "连接中..."
             myCode.value = "正在定位公网 IP..."
 
             resetIpJob = scope.launch(Dispatchers.IO) {
+                // 延迟 400 毫秒启动探测，让 App 入场动画完美、极其流畅地播放完毕后再启动网络请求！
                 delay(400)
                 try {
                     val myIpv6 = withTimeoutOrNull(4000) {
@@ -365,7 +455,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 退出连接并中止后台线程 (💡 增加 500ms 延迟重置 IP，让前台返回过渡动画完全放完后再检测网络，防止卡顿)
+        // 退出连接并中止后台线程 (增加 500ms 延迟重置 IP，让前台返回过渡动画完全放完后再检测网络，防止卡顿)
         fun cancelActiveTransfer() {
             thread {
                 try {
@@ -379,6 +469,7 @@ class MainActivity : ComponentActivity() {
                     isTransferring.value = false
                     sessionState.value = SessionState.IDLE
                     statusText.value = "已取消连接并返回"
+                    remoteCode.value = "" // 💡 彻底清空，防止下一次进入时卡片位留脏数据！
                 }
 
                 try { Thread.sleep(500) } catch (ignored: Exception) {}
@@ -406,12 +497,16 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 拦截系统返回键
+        // 拦截系统返回键 (如果是会话中，弹出物理退出确认弹窗) [1]
         BackHandler(enabled = sessionState.value != SessionState.IDLE) {
-            cancelActiveTransfer()
+            if (sessionState.value == SessionState.ACTIVE) {
+                showExitDialog = true
+            } else {
+                cancelActiveTransfer()
+            }
         }
 
-        // 文件选择器
+        // 💡 4. 文件选择器 (重新移动回正确、无红线的位置)
         val filePickerLauncher = rememberLauncherForActivityResult<String, Uri?>(
             contract = ActivityResultContracts.GetContent()
         ) { uri: Uri? ->
@@ -452,7 +547,7 @@ class MainActivity : ComponentActivity() {
             System.setProperty("java.net.preferIPv6Addresses", "true")
             System.setProperty("java.net.preferIPv4Stack", "false")
 
-            // 💡 启动时立即同步已经积攒的全局历史日志，统一前台后台控制台
+            // 启动时立即同步已经积攒的全局历史日志
             logList.clear()
             logList.addAll(AppLogger.logs)
 
@@ -475,6 +570,8 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier
                     .fillMaxSize()
                     .statusBarsPadding()
+                    // 💡 支持高低度流畅形变的全局大小平滑动画，彻底消除任何布局跳跃感 [1.1.2]
+                    .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessLow))
                     .verticalScroll(scrollState)
                     .padding(horizontal = 12.dp)
                     .padding(top = 16.dp, bottom = 100.dp),
@@ -638,8 +735,8 @@ class MainActivity : ComponentActivity() {
                                                         modifier = Modifier.padding(14.dp).fillMaxHeight(),
                                                         verticalArrangement = Arrangement.SpaceBetween
                                                     ) {
-                                                        // 💡 视觉统一：修改为“传输策略”
-                                                        Text(text = "传输策略", fontSize = 13.sp, color = Color.Gray)
+                                                        // 💡 视觉统一：本地随机端口
+                                                        Text(text = "本地随机端口", fontSize = 13.sp, color = Color.Gray)
                                                         Text(text = myPort.value.toString(), fontSize = 18.sp, fontWeight = FontWeight.Bold, color = cardTextColor)
                                                     }
                                                 }
@@ -658,7 +755,6 @@ class MainActivity : ComponentActivity() {
                                                     ) {
                                                         Text(text = "传输策略", fontSize = 13.sp, color = Color.Gray)
                                                         Text(
-                                                            // 💡 视觉统一：修改“纯TCP”为“TCP”
                                                             text = if (useUdpSync.value) "UDP + TCP" else "TCP",
                                                             fontSize = 15.sp,
                                                             fontWeight = FontWeight.Bold,
@@ -671,7 +767,7 @@ class MainActivity : ComponentActivity() {
 
                                         Spacer(modifier = Modifier.height(4.dp))
 
-                                        // 发送/接收选择卡片
+                                        // 发送/接收选择卡片 (已加入无连接状态防错)
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
                                             horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -742,192 +838,335 @@ class MainActivity : ComponentActivity() {
                                         // ==========================================
                                         //               「连接配对」界面
                                         // ==========================================
-                                        Text(
-                                            text = if (isSenderRole.value) "发送" else "接收",
-                                            fontSize = 32.sp,
-                                            fontWeight = FontWeight.Black,
-                                            color = MaterialTheme.colorScheme.onBackground,
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp),
-                                            textAlign = TextAlign.Start
-                                        )
-
-                                        // 我的本端互传码卡片
-                                        Card(
-                                            modifier = Modifier.fillMaxWidth().bounceClick {
-                                                if (myCode.value.startsWith("everyshare://")) {
-                                                    scope.launch {
-                                                        val clipData = ClipData.newPlainText("EveryShare", myCode.value)
-                                                        clipboard.setClipEntry(clipData.toClipEntry())
-                                                        android.widget.Toast.makeText(context, "连接码已复制到剪贴板！", android.widget.Toast.LENGTH_SHORT).show()
-                                                    }
-                                                }
-                                            },
-                                            shape = RoundedCornerShape(16.dp),
-                                            colors = CardDefaults.cardColors(containerColor = cardBg),
-                                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
-                                        ) {
-                                            Column(modifier = Modifier.padding(12.dp)) {
-                                                Text(text = "📱 我的本端互传码 (点击自动复制):", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                                                Spacer(modifier = Modifier.height(6.dp))
-                                                Text(text = myCode.value, fontSize = 14.sp, color = cardTextColor)
-                                            }
-                                        }
-
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
                                             horizontalArrangement = Arrangement.SpaceBetween,
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Text(text = "提供二维码供对方扫码", fontSize = 13.sp, color = Color.Gray)
-                                            Button(
-                                                onClick = { showQrCode.value = !showQrCode.value },
-                                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
-                                            ) {
-                                                Text(text = if (showQrCode.value) "隐藏二维码" else "显示二维码", fontSize = 11.sp)
-                                            }
-                                        }
-
-                                        AnimatedVisibility(visible = showQrCode.value && myCode.value.startsWith("everyshare://")) {
-                                            val qrBitmap = remember(myCode.value) { generateQrCode(myCode.value, 400) }
-                                            qrBitmap?.let {
-                                                Image(
-                                                    bitmap = it.asImageBitmap(),
-                                                    contentDescription = "QR Code",
-                                                    modifier = Modifier.size(150.dp)
-                                                )
-                                            }
-                                        }
-
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            OutlinedTextField(
-                                                value = remoteCode.value,
-                                                onValueChange = { remoteCode.value = it },
-                                                label = { Text("请输入或扫描对方的连接码") },
-                                                modifier = Modifier.weight(1f)
+                                            Text(
+                                                text = if (isSenderRole.value) "发送" else "接收",
+                                                fontSize = 32.sp,
+                                                fontWeight = FontWeight.Black,
+                                                color = MaterialTheme.colorScheme.onBackground
                                             )
-                                            Button(
-                                                onClick = {
+
+                                            // 💡 彻底去掉原“扫码”大按钮，在标题右侧增加选扫码和相册选择图标组合
+                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                IconButton(onClick = {
                                                     val options = ScanOptions().apply {
                                                         setDesiredBarcodeFormats(ScanOptions.QR_CODE)
                                                         setPrompt("将二维码放入框内即可自动扫描")
-                                                        setBeepEnabled(true)
+                                                        setBeepEnabled(false) // 💡 彻底去掉阻断噪音 [1]
                                                         setBarcodeImageEnabled(true)
-                                                        setOrientationLocked(true) // 💡 锁定竖屏！
+                                                        setOrientationLocked(true)
                                                     }
                                                     scanLauncher.launch(options)
-                                                },
-                                                modifier = Modifier.height(56.dp)
-                                            ) {
-                                                Text("扫码")
+                                                }) {
+                                                    Icon(imageVector = Icons.Default.QrCodeScanner, contentDescription = "Camera Scan", tint = cardTextColor)
+                                                }
+                                                IconButton(onClick = {
+                                                    galleryLauncher.launch("image/*") // 💡 唤起系统相册选择
+                                                }) {
+                                                    Icon(imageVector = Icons.Default.PhotoLibrary, contentDescription = "Gallery Scan", tint = cardTextColor)
+                                                }
                                             }
                                         }
 
-                                        if (isSenderRole.value) {
-                                            // 选择要发送的文件卡片
-                                            Card(
-                                                modifier = Modifier.fillMaxWidth().bounceClick {
-                                                    if (!isCachingFile.value) filePickerLauncher.launch("*/*")
+                                        // 💡 3D 双面卡片翻折重构：点击本端卡片本身，直接顺畅自转 180 度出入！ [1.1.2]
+                                        // 💡 复制操作现已精细剥离，只有点击卡片右上角的独立「Copy」图标才会触发，各司其职，永不冲突！ [1]
+                                        val rotationY by animateFloatAsState(
+                                            targetValue = if (showQrCode.value) 180f else 0f,
+                                            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
+                                            label = "3dFlip"
+                                        )
+
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .animateContentSize(animationSpec = spring(stiffness = Spring.StiffnessLow))
+                                                .graphicsLayer {
+                                                    this.rotationY = rotationY
+                                                    // 💡 物理自适应摄像机：基于宽度/高度的极小维度动态计算，完美保障所有手机按压透视高度一致 [1]
+                                                    cameraDistance = size.minDimension * 4.5f
+                                                }
+                                                .bounceClick {
+                                                    if (hasIpv6) {
+                                                        showQrCode.value = !showQrCode.value // 💡 点击卡片本体执行 3D 翻转 [1.1.2]
+                                                    } else {
+                                                        android.widget.Toast.makeText(context, "请等待公网 IP 定位成功再试", android.widget.Toast.LENGTH_SHORT).show()
+                                                    }
                                                 },
+                                            shape = RoundedCornerShape(24.dp),
+                                            colors = CardDefaults.cardColors(containerColor = cardBg),
+                                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                                        ) {
+                                            if (rotationY <= 90f) {
+                                                // 💡 卡片正面：我的互传码
+                                                Column(modifier = Modifier.padding(16.dp)) {
+                                                    Row(
+                                                        modifier = Modifier.fillMaxWidth(),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
+                                                        Text(text = "我的互传码", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+
+                                                        // 💡 顶层双排小图标：左侧手绘无死角 Copy 键，右侧 Qr 翻转标识 [1]
+                                                        Row(
+                                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                            verticalAlignment = Alignment.CenterVertically
+                                                        ) {
+                                                            // 💡 纯 Canvas 手绘的双纸张层叠复制按键（不响应卡片翻转，点击安全消费） [1]
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .size(36.dp)
+                                                                    .clip(CircleShape)
+                                                                    .clickable {
+                                                                        // 💡 回退到 100% 稳定的 Android 系统级剪贴板，彻底清除所有 suspended 反序列化 Bug
+                                                                        val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                                                        val clipData = ClipData.newPlainText("EveryShare", myCode.value)
+                                                                        clipboardManager.setPrimaryClip(clipData)
+                                                                        android.widget.Toast.makeText(context, "连接码已复制到剪贴板！", android.widget.Toast.LENGTH_SHORT).show()
+                                                                    },
+                                                                contentAlignment = Alignment.Center
+                                                            ) {
+                                                                Canvas(modifier = Modifier.size(18.dp)) {
+                                                                    val strokeWidth = 1.5.dp.toPx()
+                                                                    val cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+                                                                    // 底层纸张
+                                                                    drawRoundRect(
+                                                                        color = cardTextColor.copy(alpha = 0.8f),
+                                                                        topLeft = Offset(4.dp.toPx(), 0.dp.toPx()),
+                                                                        size = Size(10.dp.toPx(), 13.dp.toPx()),
+                                                                        cornerRadius = cornerRadius,
+                                                                        style = Stroke(width = strokeWidth)
+                                                                    )
+                                                                    // 表层纸张
+                                                                    drawRoundRect(
+                                                                        color = cardTextColor.copy(alpha = 0.8f),
+                                                                        topLeft = Offset(0.dp.toPx(), 4.dp.toPx()),
+                                                                        size = Size(10.dp.toPx(), 13.dp.toPx()),
+                                                                        cornerRadius = cornerRadius,
+                                                                        style = Stroke(width = strokeWidth)
+                                                                    )
+                                                                }
+                                                            }
+
+                                                            Icon(
+                                                                imageVector = Icons.Default.QrCodeScanner,
+                                                                contentDescription = "Flip to QR",
+                                                                tint = cardTextColor.copy(alpha = 0.6f),
+                                                                modifier = Modifier.size(18.dp)
+                                                            )
+                                                        }
+                                                    }
+                                                    Spacer(modifier = Modifier.height(8.dp))
+                                                    Text(text = myCode.value, fontSize = 14.sp, color = cardTextColor)
+                                                }
+                                            } else {
+                                                // 💡 卡片背面：二维码，scaleX = -1f 水平反向镜面回正 [1.1.2]
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .graphicsLayer { scaleX = -1f }
+                                                        .padding(16.dp),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                        Text(text = "扫码快速连接", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                                        Spacer(modifier = Modifier.height(8.dp))
+                                                        // 读取已经提前在后台算好、在内存中缓存完的 QR Bitmap
+                                                        qrBitmap?.let {
+                                                            Image(
+                                                                bitmap = it.asImageBitmap(),
+                                                                contentDescription = "QR Code",
+                                                                modifier = Modifier.size(140.dp)
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // 💡 连接配对 Bento 卡片：收纳胶囊输入框和开始连接药丸键 [1.2.1]
+                                        Card(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            shape = RoundedCornerShape(24.dp), // Bento 圆角
+                                            colors = CardDefaults.cardColors(containerColor = cardBg),
+                                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                                        ) {
+                                            Column(
+                                                modifier = Modifier.padding(16.dp),
+                                                verticalArrangement = Arrangement.spacedBy(16.dp),
+                                                horizontalAlignment = Alignment.CenterHorizontally
+                                            ) {
+                                                // 胶囊形状的配对码输入框
+                                                OutlinedTextField(
+                                                    value = remoteCode.value,
+                                                    onValueChange = { remoteCode.value = it },
+                                                    label = { Text("请输入或扫描对方的连接码") },
+                                                    shape = CircleShape, // 💡 胶囊
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    colors = OutlinedTextFieldDefaults.colors(
+                                                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                                        unfocusedBorderColor = Color.LightGray.copy(alpha = 0.5f)
+                                                    )
+                                                )
+
+                                                // 居中收缩的精美药丸状「开始连接」按钮 (点击后在运行期间自动变灰禁用)
+                                                Button(
+                                                    onClick = {
+                                                        if (remoteCode.value.isBlank()) return@Button
+                                                        // 💡 状态判定：根据 useUdpSync 的值动态给出初始状态字，拒绝任何 UDP 的穿帮闪烁！
+                                                        statusText.value = if (useUdpSync.value) "正在进行 UDP 时延校准..." else "正在进行 TCP 碰撞打洞..."
+                                                        isTransferring.value = true
+                                                        connectionProgress = -1.0f // 重置为不确定性旋转状态
+
+                                                        // 定义状态监听器
+                                                        val statusListener = StatusListener { status ->
+                                                            this@MainActivity.runOnUiThread {
+                                                                statusText.value = status
+                                                            }
+                                                        }
+
+                                                        // 保存当前的传输线程引用
+                                                        val t = thread {
+                                                            try {
+                                                                val remoteInfo = ConnectionCodeUtil.parseCode(remoteCode.value)
+                                                                val puncher = TcpPunchTransfer()
+
+                                                                val listener = ProgressListener { name, read, total, speed ->
+                                                                    progressPercent.value = ((read.toDouble() / total) * 100).toInt()
+                                                                    currentSpeed.value = speed
+                                                                    statusText.value = if (isSenderRole.value) "正在发送: $name" else "正在接收: $name"
+                                                                }
+
+                                                                val actualFakeHttpHost = if (fakeHttpOption.value == "自定义" && customFakeHttpHost.value.isNotBlank()) {
+                                                                    customFakeHttpHost.value
+                                                                } else {
+                                                                    "speedtest.cn"
+                                                                }
+
+                                                                val socket = puncher.connectByPunch(remoteInfo.ip, remoteInfo.port, myPort.value, !isSenderRole.value, useUdpSync.value, actualFakeHttpHost, statusListener)
+                                                                if (socket != null) {
+                                                                    activeSocket.value = socket
+
+                                                                    this@MainActivity.runOnUiThread {
+                                                                        connectionProgress = 1.0f // 💡 碰撞打通时，自动物理收缩形变为打勾！ [1.3.7]
+                                                                        statusText.value = "穿透成功！建立长周期会话。"
+                                                                    }
+
+                                                                    // 极爽体验：让精美的 M3 对勾动画维持 1.5 秒，之后再平滑滑动切换至 ACTIVE 传输详情页
+                                                                    try { Thread.sleep(1500) } catch (ignored: Exception) {}
+
+                                                                    sessionState.value = SessionState.ACTIVE
+
+                                                                    // 如果是接收者，在此条长 Socket 通道中进入后台循环，保持随时监听、一键多次接收文件！
+                                                                    if (!isSenderRole.value) {
+                                                                        val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(
+                                                                            android.os.Environment.DIRECTORY_DOWNLOADS
+                                                                        )
+                                                                        val everyShareDir = File(downloadDir, "EveryShare")
+                                                                        if (!everyShareDir.exists()) everyShareDir.mkdirs()
+                                                                        val saveDir = if (everyShareDir.exists()) everyShareDir.absolutePath else downloadDir.absolutePath
+
+                                                                        while (activeSocket.value != null && !activeSocket.value!!.isClosed) {
+                                                                            puncher.receiveFile(socket, saveDir, listener)
+                                                                            this@MainActivity.runOnUiThread { statusText.value = "🎉 接收成功！已存入公共下载目录" }
+                                                                        }
+                                                                    }
+                                                                } else {
+                                                                    AppLogger.info("❌ 穿透失败，请确认双方同时开启")
+                                                                    this@MainActivity.runOnUiThread {
+                                                                        isTransferring.value = false
+                                                                    }
+                                                                }
+                                                            } catch (e: Exception) {
+                                                                AppLogger.error("会话执行失败", e)
+                                                                this@MainActivity.runOnUiThread {
+                                                                    isTransferring.value = false
+                                                                }
+                                                            } finally {
+                                                                // 💡 核心修复：添加并补全线程回收时的 finally 状态复位，确保 isTransferring 强制回蓝，彻底恢复“选择文件”卡片的点击可用性！ [1]
+                                                                this@MainActivity.runOnUiThread {
+                                                                    isTransferring.value = false
+                                                                    progressPercent.value = 0
+                                                                    currentSpeed.value = 0.0
+                                                                }
+                                                                activeTransferThread.value = null
+                                                            }
+                                                        }
+                                                        activeTransferThread.value = t
+                                                    },
+                                                    shape = CircleShape,
+                                                    modifier = Modifier.width(160.dp).height(44.dp), // 💡 尺寸精简，药丸状
+                                                    enabled = !isTransferring.value && remoteCode.value.isNotBlank() // 💡 传输中按钮置灰
+                                                ) {
+                                                    Text(text = "开始连接", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                                }
+                                            }
+                                        }
+
+                                        // 💡 彻底重构状态卡：左侧放置自转变形加载图标，中间一根细线，右侧配合滚动淡入淡出动画展示文字 (移除了下方累赘的速度进度行) [2]
+                                        AnimatedVisibility(
+                                            visible = isTransferring.value,
+                                            enter = expandVertically(animationSpec = tween(300)) + fadeIn(),
+                                            exit = shrinkVertically(animationSpec = tween(300)) + fadeOut()
+                                        ) {
+                                            Card(
+                                                modifier = Modifier.fillMaxWidth(),
                                                 shape = RoundedCornerShape(16.dp),
                                                 colors = CardDefaults.cardColors(containerColor = cardBg),
                                                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                             ) {
-                                                Column(modifier = Modifier.padding(12.dp)) {
-                                                    Text(text = "📂 选择要发送的文件 (点击浏览):", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
-                                                    Spacer(modifier = Modifier.height(4.dp))
-                                                    Text(
-                                                        text = if (selectedFileName.value.isEmpty()) "点击选择手机上的任意文件" else "${selectedFileName.value} (${selectedFileSize.value / 1024 / 1024} MB)",
-                                                        fontSize = 14.sp,
-                                                        color = cardTextColor
+                                                Row(
+                                                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                                                ) {
+                                                    // 左侧：优先调用 M3 官方原生 LoadingIndicator [1.3.7]
+                                                    // 进度小于 0.0f（即 -1.0f 状态）时无限旋转形变；当成功连接进度写为 1.0f 时，自动物理收缩形变为打勾！ [1.3.7]
+                                                    @OptIn(androidx.compose.material3.ExperimentalMaterial3ExpressiveApi::class)
+                                                    if (connectionProgress < 0f) {
+                                                        LoadingIndicator(modifier = Modifier.size(54.dp))
+                                                    } else {
+                                                        LoadingIndicator(
+                                                            progress = { connectionProgress },
+                                                            modifier = Modifier.size(54.dp)
+                                                        )
+                                                    }
+
+                                                    // 中间：垂直微细分割线 [2]
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(1.dp)
+                                                            .height(36.dp)
+                                                            .background(Color.LightGray.copy(alpha = 0.4f))
                                                     )
+
+                                                    // 右侧：状态文字 (纵向滚动淡入淡出动画，且只保留单行状态字) [2]
+                                                    Box(modifier = Modifier.weight(1f)) {
+                                                        AnimatedContent(
+                                                            targetState = statusText.value,
+                                                            transitionSpec = {
+                                                                (slideInVertically { height -> height } + fadeIn(animationSpec = tween(300)))
+                                                                    .togetherWith(slideOutVertically { height -> -height } + fadeOut(animationSpec = tween(300)))
+                                                            },
+                                                            label = "StatusText"
+                                                        ) { targetText ->
+                                                            Text(
+                                                                text = targetText,
+                                                                fontSize = 13.sp,
+                                                                fontWeight = FontWeight.SemiBold,
+                                                                color = cardTextColor
+                                                            )
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
 
-                                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                            Checkbox(checked = useUdpSync.value, onCheckedChange = { useUdpSync.value = it })
-                                            Text(text = "使用高精度 UDP 引导同步 (推荐)", fontSize = 13.sp)
-                                        }
-
-                                        Text(text = "当前状态: ${statusText.value}", fontSize = 14.sp)
-
-                                        if (isTransferring.value) {
-                                            LinearProgressIndicator(progress = { progressPercent.value / 100f }, modifier = Modifier.fillMaxWidth())
-                                            Text(text = String.format("速度: %.2f MB/s | 进度: %d%%", currentSpeed.value, progressPercent.value), fontSize = 13.sp)
-                                        }
-
-                                        Button(
-                                            onClick = {
-                                                if (remoteCode.value.isBlank()) return@Button
-                                                statusText.value = if (useUdpSync.value) "正在进行 UDP 时延校准..." else "正在进行 TCP 碰撞打洞..."
-                                                isTransferring.value = true
-
-                                                // 💡 保存当前的传输线程引用，用于支持用户随时中断
-                                                val t = thread {
-                                                    try {
-                                                        val remoteInfo = ConnectionCodeUtil.parseCode(remoteCode.value)
-                                                        val puncher = TcpPunchTransfer()
-
-                                                        val listener = ProgressListener { name, read, total, speed ->
-                                                            progressPercent.value = ((read.toDouble() / total) * 100).toInt()
-                                                            currentSpeed.value = speed
-                                                            statusText.value = if (isSenderRole.value) "正在发送: $name" else "正在接收: $name"
-                                                        }
-
-                                                        val socket = puncher.connectByPunch(remoteInfo.ip, remoteInfo.port, myPort.value, !isSenderRole.value, useUdpSync.value, "speedtest.cn")
-                                                        if (socket != null) {
-                                                            activeSocket.value = socket
-                                                            sessionState.value = SessionState.ACTIVE
-                                                            AppLogger.info("穿透成功！建立长生命周期会话。")
-
-                                                            if (isSenderRole.value) {
-                                                                val tempCacheFile = File(context.cacheDir, "temp_upload.dat")
-                                                                FileInputStream(tempCacheFile).use { fileInputStream ->
-                                                                    puncher.sendFile(socket, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
-                                                                }
-                                                                AppLogger.info("文件发送完成！")
-                                                            } else {
-                                                                val downloadDir = android.os.Environment.getExternalStoragePublicDirectory(
-                                                                    android.os.Environment.DIRECTORY_DOWNLOADS
-                                                                )
-                                                                val everyShareDir = File(downloadDir, "EveryShare")
-                                                                if (!everyShareDir.exists()) everyShareDir.mkdirs()
-                                                                val saveDir = if (everyShareDir.exists()) everyShareDir.absolutePath else downloadDir.absolutePath
-
-                                                                puncher.receiveFile(socket, saveDir, listener)
-                                                                AppLogger.info("🎉 接收成功！已存入公共下载目录")
-                                                            }
-                                                        } else {
-                                                            AppLogger.info("❌ 穿透失败，请确认双方同时开启")
-                                                            this@MainActivity.runOnUiThread {
-                                                                isTransferring.value = false
-                                                            }
-                                                        }
-                                                    } catch (e: Exception) {
-                                                        AppLogger.error("会话执行失败", e)
-                                                        this@MainActivity.runOnUiThread {
-                                                            isTransferring.value = false
-                                                        }
-                                                    } finally {
-                                                        activeTransferThread.value = null
-                                                    }
-                                                }
-                                                activeTransferThread.value = t
-                                            },
-                                            modifier = Modifier.fillMaxWidth().height(50.dp),
-                                            enabled = remoteCode.value.isNotBlank() && (!isSenderRole.value || (selectedFileUri.value != null && !isCachingFile.value))
-                                        ) {
-                                            Text(text = "开始连接并进入会话", fontSize = 15.sp)
-                                        }
-
-                                        TextButton(onClick = { cancelActiveTransfer() }) {
-                                            Text("返回首页")
-                                        }
-
+                                        // 💡 如果对方端口失效一直连不上，点击此按钮可真正中止后台打洞，优雅返回！
+                                        // 💡 按照要求，将配对界面的“返回首页”大按钮彻底去掉，完全交由系统/手势返回键控制
                                     } else if (sessionState.value == SessionState.ACTIVE) {
                                         // ==========================================
                                         //               「会话传输中」界面
@@ -944,22 +1183,26 @@ class MainActivity : ComponentActivity() {
                                         Spacer(modifier = Modifier.height(10.dp))
 
                                         if (isSenderRole.value) {
+                                            // 💡 核心改动：将“选择文件”卡片从连接配对界面移动到会话详情中！
                                             Card(
                                                 modifier = Modifier.fillMaxWidth().bounceClick {
                                                     if (!isCachingFile.value && !isTransferring.value) filePickerLauncher.launch("*/*")
                                                 },
-                                                colors = CardDefaults.cardColors(containerColor = cardBg)
+                                                colors = CardDefaults.cardColors(containerColor = cardBg),
+                                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                             ) {
                                                 Column(modifier = Modifier.padding(12.dp)) {
-                                                    Text(text = "📂 选择另一个要发送的文件 (点击浏览):", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
+                                                    Text(text = "📂 选择要发送的文件 (点击浏览):", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
                                                     Spacer(modifier = Modifier.height(4.dp))
                                                     Text(
-                                                        text = if (selectedFileName.value.isEmpty()) "点击浏览" else "${selectedFileName.value} (${selectedFileSize.value / 1024 / 1024} MB)",
+                                                        text = if (selectedFileName.value.isEmpty()) "点击选择手机上的任意文件" else "${selectedFileName.value} (${selectedFileSize.value / 1024 / 1024} MB)",
                                                         fontSize = 14.sp,
                                                         color = cardTextColor
                                                     )
                                                 }
                                             }
+
+                                            Spacer(modifier = Modifier.height(8.dp))
 
                                             Button(
                                                 onClick = {
@@ -1002,6 +1245,7 @@ class MainActivity : ComponentActivity() {
 
                                         Text(text = "传输状态: ${statusText.value}", fontSize = 14.sp)
 
+                                        // 💡 只有在正式 ACTIVE 状态的文件流读写传输中，才展示细长进度条与速度数值
                                         if (isTransferring.value) {
                                             LinearProgressIndicator(progress = { progressPercent.value / 100f }, modifier = Modifier.fillMaxWidth())
                                             Text(text = String.format("速度: %.2f MB/s | 进度: %d%%", currentSpeed.value, progressPercent.value), fontSize = 13.sp)
@@ -1010,7 +1254,7 @@ class MainActivity : ComponentActivity() {
                                         Spacer(modifier = Modifier.weight(1f))
 
                                         Button(
-                                            onClick = { cancelActiveTransfer() },
+                                            onClick = { showExitDialog = true }, // 💡 弹出 3D 物理弹性退出弹窗 [1]
                                             modifier = Modifier.fillMaxWidth(),
                                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                                         ) {
@@ -1044,8 +1288,8 @@ class MainActivity : ComponentActivity() {
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
                                         text = "依赖公网 IPv6 实现点对点传输，通过 TCP Simultaneous Open 打开防火墙，FAKE HTTP HEADER 绕过上行限速。\n仅在本地测试有效。还需其他地区，其他运营商，不同环境下测试。",
-                                        fontSize = 12.sp,
-                                        lineHeight = 17.sp,
+                                        fontSize = 11.sp,
+                                        lineHeight = 16.sp,
                                         color = if (isDark) Color.LightGray else Color.Gray
                                     )
                                 }
@@ -1054,7 +1298,7 @@ class MainActivity : ComponentActivity() {
                             // 声明折叠状态：默认收起（false）
                             var showAppearanceDetail by remember { mutableStateOf(false) }
 
-                            // 外观卡片 (Settings > Appearance) (已去掉 border)
+                            // 外观卡片 (Settings > Appearance) (已去掉所有边框与 spacedBy 割裂感) [2]
                             Card(
                                 modifier = Modifier.fillMaxWidth().clickable { showAppearanceDetail = !showAppearanceDetail },
                                 shape = RoundedCornerShape(20.dp),
@@ -1069,7 +1313,7 @@ class MainActivity : ComponentActivity() {
                                         Text(text = if (showAppearanceDetail) "收起" else "展开", fontSize = 11.sp, color = Color.Gray)
                                     }
 
-                                    // 💡 彻底修复割裂感：移除父级 spacedBy，所有分割线和间距完全收纳进 AnimatedVisibility
+                                    // 💡 彻底修复割裂感：移除外层 spacedBy，所有分割线和间距完全收纳进 AnimatedVisibility
                                     AnimatedVisibility(
                                         visible = showAppearanceDetail,
                                         enter = expandVertically(animationSpec = tween(300)) + fadeIn(),
@@ -1215,7 +1459,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
 
-                            // 💡 传输策略设置卡片 (M3 标准下拉源选择器风格) (已去掉所有边框与 spacedBy 割裂感) [2]
+                            // 💡 传输策略设置卡片：全新重构为 “双分栏阻尼滑动小药丸” 设计，与深色模式高度对称 [2]
                             var showStrategyDetail by remember { mutableStateOf(false) }
                             Card(
                                 modifier = Modifier.fillMaxWidth().clickable { showStrategyDetail = !showStrategyDetail },
@@ -1246,52 +1490,41 @@ class MainActivity : ComponentActivity() {
                                                 Text(text = "TCP：尝试直接向对方发 TCP 包打通两端 TCP 防火墙", fontSize = 10.sp, lineHeight = 14.sp, color = Color.Gray)
                                             }
 
-                                            // 💡 彻底修复：点击输入框整行任意位置自动触发下拉，而不需要点右侧小箭头 [2]
-                                            var dropdownExpanded by remember { mutableStateOf(false) }
-                                            Box(
+                                            // 💡 传输策略双分栏滑动药丸 [2]
+                                            BoxWithConstraints(
                                                 modifier = Modifier
                                                     .fillMaxWidth()
-                                                    .clickable { dropdownExpanded = true } // 💡 整行点击！
+                                                    .height(44.dp)
+                                                    .clip(RoundedCornerShape(12.dp))
+                                                    .background(if (isDark) Color(0xFF1E1E1E) else Color.LightGray.copy(alpha = 0.2f))
+                                                    .padding(2.dp)
                                             ) {
-                                                OutlinedTextField(
-                                                    value = if (useUdpSync.value) "UDP + TCP (推荐)" else "TCP",
-                                                    onValueChange = {},
-                                                    readOnly = true,
-                                                    enabled = false, // 💡 关闭本身交互，把点击权完全让渡给外层 Box
-                                                    label = { Text("传输策略") },
-                                                    trailingIcon = {
-                                                        Icon(
-                                                            imageVector = if (dropdownExpanded) Icons.Default.ArrowDropUp else Icons.Default.ArrowDropDown,
-                                                            contentDescription = null,
-                                                            tint = cardTextColor
-                                                        )
-                                                    },
-                                                    colors = OutlinedTextFieldDefaults.colors(
-                                                        disabledTextColor = cardTextColor,
-                                                        disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                        disabledBorderColor = MaterialTheme.colorScheme.outline,
-                                                        disabledContainerColor = Color.Transparent
-                                                    ),
-                                                    modifier = Modifier.fillMaxWidth()
+                                                val innerWidth = maxWidth - 4.dp
+                                                val pillWidth = innerWidth / 2 // 💡 精确 50% 均分空间
+                                                val selectedIndex = if (useUdpSync.value) 0 else 1
+                                                val indicatorOffset by animateDpAsState(targetValue = pillWidth * selectedIndex)
+
+                                                Box(
+                                                    modifier = Modifier
+                                                        .offset(x = indicatorOffset)
+                                                        .width(pillWidth)
+                                                        .fillMaxHeight()
+                                                        .clip(RoundedCornerShape(10.dp))
+                                                        .background(MaterialTheme.colorScheme.primary)
                                                 )
-                                                DropdownMenu(
-                                                    expanded = dropdownExpanded,
-                                                    onDismissRequest = { dropdownExpanded = false },
-                                                    modifier = Modifier.fillMaxWidth(0.9f).background(cardBg)
-                                                ) {
-                                                    DropdownMenuItem(
-                                                        text = { Text("UDP + TCP (推荐)", color = cardTextColor) },
-                                                        onClick = {
-                                                            onUseUdpSyncChange(true)
-                                                            dropdownExpanded = false
-                                                        }
+
+                                                Row(modifier = Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
+                                                    ThemeModePill(
+                                                        text = "UDP + TCP (推荐)",
+                                                        isSelected = useUdpSync.value,
+                                                        onClick = { onUseUdpSyncChange(true) },
+                                                        modifier = Modifier.weight(1f)
                                                     )
-                                                    DropdownMenuItem(
-                                                        text = { Text("TCP", color = cardTextColor) },
-                                                        onClick = {
-                                                            onUseUdpSyncChange(false)
-                                                            dropdownExpanded = false
-                                                        }
+                                                    ThemeModePill(
+                                                        text = "TCP",
+                                                        isSelected = !useUdpSync.value,
+                                                        onClick = { onUseUdpSyncChange(false) },
+                                                        modifier = Modifier.weight(1f)
                                                     )
                                                 }
                                             }
@@ -1489,7 +1722,7 @@ class MainActivity : ComponentActivity() {
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(text = "运行日志控制台", fontSize = 13.sp, color = Color.Gray)
+                    Text(text = "运行日志", fontSize = 13.sp, color = Color.Gray)
                     TextButton(onClick = { showLogs.value = !showLogs.value }) {
                         Text(text = if (showLogs.value) "隐藏日志" else "展开日志", fontSize = 12.sp)
                     }
@@ -1568,7 +1801,7 @@ class MainActivity : ComponentActivity() {
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
-                            .weight(1f) // width(80.dp) 改为 weight(1f) 保证宽度为精确的 86.dp
+                            .weight(1f) // width(80.dp) 改为 weight(1f) 保证宽度为精确 of 86.dp
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
@@ -1587,7 +1820,7 @@ class MainActivity : ComponentActivity() {
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
-                            .weight(1f) // width(80.dp) 改为 weight(1f) 保证宽度为精确的 86.dp
+                            .weight(1f) // width(80.dp) 改为 weight(1f) 保证宽度为精确 of 86.dp
                             .clickable(
                                 interactionSource = remember { MutableInteractionSource() },
                                 indication = null
@@ -1600,6 +1833,88 @@ class MainActivity : ComponentActivity() {
                             fontWeight = FontWeight.Bold,
                             fontSize = 13.sp
                         )
+                    }
+                }
+            }
+
+            // 💡 3D 物理弹性退出确认弹窗 (当用户在会话中尝试返回或断开连接时，学谷歌官方以标准的淡入 + 缓动微缩放弹出，极其高级) [1]
+            AnimatedVisibility(
+                // 💡 彻底修复：使用普通高级 M3 缩放微过渡，不再使用生硬多余的弹跳动画
+                visible = showExitDialog,
+                enter = fadeIn(animationSpec = tween(150)) + scaleIn(
+                    animationSpec = tween(280, easing = androidx.compose.animation.core.FastOutSlowInEasing),
+                    initialScale = 0.92f
+                ),
+                exit = fadeOut(animationSpec = tween(100)) + scaleOut(
+                    animationSpec = tween(180),
+                    targetScale = 0.92f
+                )
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.5f))
+                        .pointerInput(Unit) { detectTapGestures { /* 阻断背景点击 */ } },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Card(
+                        modifier = Modifier
+                            .width(280.dp)
+                            .padding(16.dp),
+                        shape = RoundedCornerShape(24.dp),
+                        colors = CardDefaults.cardColors(containerColor = cardBg),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(20.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = "会话正在进行中",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 16.sp,
+                                color = cardTextColor
+                            )
+                            Text(
+                                text = "你确定要退出会话吗？",
+                                fontSize = 13.sp,
+                                color = Color.Gray,
+                                textAlign = TextAlign.Center
+                            )
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // 左边取消：无边框纯文字，不带椭圆
+                                Text(
+                                    text = "取消",
+                                    color = Color.Gray,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 13.sp,
+                                    modifier = Modifier
+                                        .clickable(
+                                            interactionSource = remember { MutableInteractionSource() },
+                                            indication = null
+                                        ) { showExitDialog = false }
+                                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                // 右边确定：主色背景椭圆小药丸按钮 [1]
+                                Button(
+                                    onClick = {
+                                        showExitDialog = false
+                                        cancelActiveTransfer()
+                                    },
+                                    shape = CircleShape,
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                                ) {
+                                    Text(text = "确定", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1671,7 +1986,7 @@ fun ThemeIcon(
             path.close()
             drawPath(path = path, color = color)
 
-            // 如果被选中，在中心绘制一个精致的白色对勾
+            // 如果被选中，在中心绘制一个精致的白色对勾 [1]
             if (isSelected) {
                 val strokeWidth = 3.dp.toPx()
                 val checkPath = Path().apply {
@@ -1720,6 +2035,61 @@ fun ThemeModePill(
     }
 }
 
+// 💡 M3 风格：自转与几何形变双重过渡的现代加载图标组件 [2]
+// 💡 采用 CubicBezier(0.42, 0.0, 0.58, 1.0) Easing，完美实现一快一慢、极具液态Q弹特征的加载律动
+@androidx.compose.runtime.Composable
+fun MorphingLoader(modifier: Modifier = Modifier) {
+    val primaryColor = androidx.compose.material3.MaterialTheme.colorScheme.primary
+    val infiniteTransition = androidx.compose.animation.core.rememberInfiniteTransition(label = "morph")
+
+    // 1. 控制几何形变进度的缓动曲线 (Ease-In-Out 贝塞尔曲线，一快一慢) [2]
+    val rawProgress by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(
+                durationMillis = 2000,
+                easing = androidx.compose.animation.core.LinearEasing
+            ),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+        ),
+        label = "progress"
+    )
+
+    // 💡 核心数学转换：将线性 progress 通过标准的 Ease-In-Out 贝塞尔曲线进行非线性映射，实现物理级一快一慢 [2]
+    val progress = androidx.compose.animation.core.CubicBezierEasing(0.42f, 0.0f, 0.58f, 1.0f).transform(rawProgress)
+
+    // 2. 控制 360 度匀速自转
+    val rotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(3000, easing = androidx.compose.animation.core.LinearEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Restart
+        ),
+        label = "rotation"
+    )
+
+    Canvas(modifier = modifier.graphicsLayer { rotationZ = rotation }) {
+        val path = Path()
+        val center = Offset(size.width / 2, size.height / 2)
+        val maxRadius = size.minDimension / 2
+        val points = 8
+        val innerRatio = 0.5f + (0.45f * progress) // 💡 利用映射后的 progress 渲染平滑 Q 弹效果
+        val innerRadius = maxRadius * innerRatio
+        val angleStep = Math.PI / points
+
+        for (i in 0 until 2 * points) {
+            val r = if (i % 2 == 0) maxRadius else innerRadius
+            val angle = i * angleStep
+            val x = (center.x + r * Math.cos(angle)).toFloat()
+            val y = (center.y + r * Math.sin(angle)).toFloat()
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        path.close()
+        drawPath(path = path, color = primaryColor)
+    }
+}
 
 // 极致 3D 物理下沉变暗动效 (已彻底修复 `pointerInput(Unit)` 闭包捕获历史旧状态的经典 Bug)
 fun Modifier.bounceClick(onClick: () -> Unit): Modifier = composed {

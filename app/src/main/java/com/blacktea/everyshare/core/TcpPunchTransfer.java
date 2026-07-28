@@ -14,7 +14,40 @@ import java.util.List;
 
 public class TcpPunchTransfer {
     private static final Logger log = LoggerFactory.getLogger(TcpPunchTransfer.class);
-    private static final String FAKE_HTTP_HEADER = "GET / HTTP/1.1\r\nHost: speedtest.cn\r\n\r\n";
+    private static final String FAKE_HTTP_HEADER = "GET / HTTP/1.1\r\nHost: %s\r\n\r\n";
+
+    // 不关流的输入流包装器，防止 try-with-resources 自动关闭底层 Socket [1, 2]
+    private static class NonCloseableInputStream extends FilterInputStream {
+        public NonCloseableInputStream(InputStream in) {
+            super(in);
+        }
+        @Override
+        public void close() throws IOException {
+            // 保持静默，不关闭底层的网络 Socket 流 [1]
+        }
+    }
+
+    // 不关流的输出流包装器，重写 write 方法，防止速度阻断 [1, 2]
+    private static class NonCloseableOutputStream extends FilterOutputStream {
+        public NonCloseableOutputStream(OutputStream out) {
+            super(out);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            out.write(b, off, len);
+        }
+
+        @Override
+        public void write(byte[] b) throws IOException {
+            out.write(b);
+        }
+
+        @Override
+        public void close() throws IOException {
+            out.flush(); // 仅执行冲刷，不关闭底层 Socket 流 [1]
+        }
+    }
 
     public static InetAddress getActivePublicIpv6() {
         String[] apis = { "https://api6.ipify.org", "https://v6.ident.me" };
@@ -60,9 +93,6 @@ public class TcpPunchTransfer {
         return null;
     }
 
-    /**
-     * 💡 核心新增：获取本机所有真实物理 IPv6 字符串列表，用于进行 NAT6 检测
-     */
     public static List<String> getLocalIPv6List() {
         List<String> list = new ArrayList<>();
         try {
@@ -85,17 +115,15 @@ public class TcpPunchTransfer {
         return list;
     }
 
-    private double alignTimeByUdpWithIp(InetAddress localIp, String remoteIp, int remotePort, int localPort, boolean isMaster) {
+    private double alignTimeByUdpWithIp(InetAddress localIp, String remoteIp, int remotePort, int localPort, boolean isMaster, StatusListener statusListener) {
+        if (statusListener != null) statusListener.onStatusUpdate("正在进行 UDP 时延校准...");
         AppLogger.info("[UDP] Starting sync and time alignment...");
         double slaveWaitTimeMs = 0;
 
         try (DatagramSocket udpSocket = new DatagramSocket(null)) {
             udpSocket.setReuseAddress(true);
-            // 💡 直接使用传入的 localIp，消除了底层的二次 HTTP 请求
             udpSocket.bind(new InetSocketAddress(localIp, localPort));
             udpSocket.setSoTimeout(300);
-
-            // ... 后面原有的握手和 RTT 测算代码完全保持不变 ...
 
             InetAddress remoteAddress = InetAddress.getByName(remoteIp);
             byte[] sendBuf = "UDP_HELLO".getBytes(StandardCharsets.UTF_8);
@@ -106,8 +134,11 @@ public class TcpPunchTransfer {
             long lastSendTime = 0;
 
             while (!handshakeConnected) {
+                if (Thread.currentThread().isInterrupted()) return 0;
+
                 long now = System.currentTimeMillis();
                 if (now - lastSendTime > 300) {
+                    AppLogger.info("[UDP] Sending UDP_HELLO handshakes to [{}]...", remoteIp);
                     udpSocket.send(new DatagramPacket(sendBuf, sendBuf.length, remoteAddress, remotePort));
                     lastSendTime = now;
                 }
@@ -129,7 +160,9 @@ public class TcpPunchTransfer {
                 byte[] ping = "PING_RTT".getBytes(StandardCharsets.UTF_8);
 
                 for (int i = 0; i < 3; i++) {
+                    if (Thread.currentThread().isInterrupted()) return 0;
                     long t1 = System.nanoTime();
+                    AppLogger.info("[UDP] Sending RTT probe #{}...", i + 1);
                     udpSocket.send(new DatagramPacket(ping, ping.length, remoteAddress, remotePort));
                     try {
                         udpSocket.receive(receivePacket);
@@ -149,6 +182,9 @@ public class TcpPunchTransfer {
                 double slaveWait = targetDelay - oneWayDelay;
 
                 AppLogger.info("[UDP] Calibration done: RTT = {}ms", String.format("%.1f", rtt));
+                if (statusListener != null) {
+                    statusListener.onStatusUpdate("时延校准完成: RTT = " + String.format("%.1f", rtt) + "ms");
+                }
 
                 String syncMsg = "START_TCP_DELAY:" + slaveWait;
                 byte[] syncBytes = syncMsg.getBytes(StandardCharsets.UTF_8);
@@ -157,7 +193,6 @@ public class TcpPunchTransfer {
                     Thread.sleep(10);
                 }
 
-                AppLogger.info("[UDP] Master countdown: {}ms...", String.format("%.1f", masterWait));
                 return masterWait;
 
             } else {
@@ -165,6 +200,7 @@ public class TcpPunchTransfer {
                 udpSocket.setSoTimeout(3000);
 
                 while (true) {
+                    if (Thread.currentThread().isInterrupted()) return 0;
                     try {
                         udpSocket.receive(receivePacket);
                         String msg = new String(receivePacket.getData(), 0, receivePacket.getLength(), StandardCharsets.UTF_8);
@@ -181,7 +217,6 @@ public class TcpPunchTransfer {
                         break;
                     }
                 }
-                AppLogger.info("[UDP] Slave countdown: {}ms...", String.format("%.1f", slaveWaitTimeMs));
                 return slaveWaitTimeMs;
             }
 
@@ -191,8 +226,8 @@ public class TcpPunchTransfer {
         return 0;
     }
 
-    public Socket connectByPunch(String remoteIp, int remotePort, int localPort, boolean isMaster, boolean useUdpSync, String fakeHttpHost) {
-        // 1. 提前获取好物理 IP 并缓存，后续不再发起任何阻塞网络查询
+    public Socket connectByPunch(String remoteIp, int remotePort, int localPort, boolean isMaster, boolean useUdpSync, String fakeHttpHost, StatusListener statusListener) {
+        // 1. 在最外层获取并缓存 IP
         InetAddress localIp = getActivePublicIpv6();
         if (localIp == null) {
             try {
@@ -201,19 +236,28 @@ public class TcpPunchTransfer {
         }
 
         if (localIp == null) {
-            AppLogger.info("[ERROR] 无法启动穿透：未找到本机有效的公网 IPv6 地址");
+            if (statusListener != null) statusListener.onStatusUpdate("错误: 未找到公网 IPv6 地址");
+            AppLogger.info("[ERROR] Failed to start: No valid public IPv6 found.");
             return null;
         }
 
+        // 2. 进行高精度 UDP 引导同步
         if (useUdpSync) {
-            // 💡 核心修改：将已经拿到的 localIp 传入 UDP 校准方法中，彻底对齐参数
-            double waitTimeMs = alignTimeByUdpWithIp(localIp, remoteIp, remotePort, localPort, isMaster);
+            double waitTimeMs = alignTimeByUdpWithIp(localIp, remoteIp, remotePort, localPort, isMaster, statusListener);
             if (waitTimeMs > 0) {
-                try { Thread.sleep((long) waitTimeMs); } catch (InterruptedException ignored) {}
+                // 💡 捍卫高精度时钟对齐：去除在这里多余的 1 秒 Thread.sleep，让打洞起跑对准每一毫秒！
+                try { Thread.sleep((long) waitTimeMs); } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
             }
-            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
         }
 
+        if (statusListener != null) statusListener.onStatusUpdate("正在进行 TCP 碰撞打洞...");
         AppLogger.info("==================================================");
         AppLogger.info("      ⏰ TCP Punching: START ({} mode) ⏰", useUdpSync ? "UDP-Aligned" : "Direct-Collision");
         AppLogger.info("==================================================");
@@ -223,7 +267,7 @@ public class TcpPunchTransfer {
 
         while (true) {
             if (Thread.currentThread().isInterrupted()) {
-                AppLogger.info("[TCP] 用户主动取消了连接，正在退出碰撞...");
+                AppLogger.info("[TCP] Connection canceled by user.");
                 return null;
             }
 
@@ -234,27 +278,37 @@ public class TcpPunchTransfer {
                 socket.setReuseAddress(true);
                 socket.bind(new InetSocketAddress(localIp, localPort));
 
-                AppLogger.info("Attempt {}: Initiating synchronized connection...", attempt);
+                AppLogger.info("[TCP] Attempt {}: Connecting to [{}]:{}...", attempt, remoteIp, remotePort);
                 socket.connect(new InetSocketAddress(remoteIp, remotePort), (int) timeoutMs);
+
+                if (statusListener != null) statusListener.onStatusUpdate("打通成功！正在清洗混淆数据...");
                 AppLogger.info("[SUCCESS] TCP punch established successfully!");
 
                 OutputStream os = socket.getOutputStream();
                 InputStream is = socket.getInputStream();
 
-                String fakeHeader = "GET / HTTP/1.1\r\nHost: " + fakeHttpHost + "\r\n\r\n";
+                String fakeHeader = String.format(FAKE_HTTP_HEADER, fakeHttpHost);
                 os.write(fakeHeader.getBytes(StandardCharsets.UTF_8));
                 os.flush();
 
-                int targetLength = fakeHeader.length();
-                byte[] cleanBuffer = new byte[targetLength];
-                int totalRead = 0;
-                while (totalRead < targetLength) {
-                    int read = is.read(cleanBuffer, totalRead, targetLength - totalRead);
-                    if (read == -1) throw new IOException("Connection closed prematurely");
-                    totalRead += read;
+                // 双回车 \r\n\r\n 动态检测算法，不限域名长度，清洗得干干净净 [2.1.2]
+                int crlfCount = 0;
+                while (true) {
+                    int b = is.read();
+                    if (b == -1) throw new IOException("Connection closed prematurely");
+                    char c = (char) b;
+                    if (c == '\r' || c == '\n') {
+                        crlfCount++;
+                        if (crlfCount >= 4) {
+                            break;
+                        }
+                    } else {
+                        crlfCount = 0;
+                    }
                 }
 
                 AppLogger.info("[DPI] Successfully exchanged and cleaned FakeHTTP headers.");
+                if (statusListener != null) statusListener.onStatusUpdate("通道就绪！");
                 return socket;
             } catch (Exception e) {
                 try {
@@ -272,8 +326,9 @@ public class TcpPunchTransfer {
     }
 
     public void sendFile(Socket socket, InputStream fileStream, String fileName, long fileSize, ProgressListener listener) {
-        try (OutputStream os = socket.getOutputStream();
-             InputStream is = socket.getInputStream();
+        // 💡 彻底修复：使用不关流包装器保护 Socket 生命周期 [1, 2]
+        try (OutputStream os = new NonCloseableOutputStream(socket.getOutputStream());
+             InputStream is = new NonCloseableInputStream(socket.getInputStream());
              ProgressInputStream progressInputStream = new ProgressInputStream(fileStream, fileName, fileSize, listener)) {
 
             String metaData = "PREPARE:" + fileName + ":" + fileSize + "\n";
@@ -283,9 +338,14 @@ public class TcpPunchTransfer {
             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
             String response = reader.readLine();
 
+            // 💡 彻底修复对端下线误判：如果读取返回 null，说明接收端（对方）已经退出了会话，抛出精准异常 [2]
+            if (response == null) {
+                throw new IOException("Connection lost: peer is offline");
+            }
+
             if (!"ACCEPT".equals(response)) {
                 AppLogger.info("[WARN] Receiver rejected file: {}", fileName);
-                return;
+                throw new IOException("File rejected by receiver");
             }
 
             AppLogger.info("[OK] Receiver accepted. Starting upload...");
@@ -298,25 +358,38 @@ public class TcpPunchTransfer {
             os.flush();
             AppLogger.info("[SUCCESS] File [{}] sent successfully", fileName);
         } catch (Exception e) {
-            AppLogger.error("Error occurred while sending file", e);
+            AppLogger.error("Error occurred while sending file: " + fileName, e);
+            throw new RuntimeException(e);
         }
     }
 
     public void receiveFile(Socket socket, String saveDir, ProgressListener listener) {
-        try (InputStream is = socket.getInputStream();
-             OutputStream os = socket.getOutputStream()) {
+        File destFile = null;
+        String fileName = "unknown";
+        // 💡 彻底修复：使用不关流包装器保护 Socket 生命周期 [1, 2]
+        try (InputStream is = new NonCloseableInputStream(socket.getInputStream());
+             OutputStream os = new NonCloseableOutputStream(socket.getOutputStream())) {
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
             String metaData = reader.readLine();
 
-            if (metaData == null || !metaData.startsWith("PREPARE:")) {
+            // 💡 彻底修复对端下线误判：如果发送端主动断开，读取为 null，抛出异常 [2]
+            if (metaData == null) {
+                throw new IOException("Connection lost: peer is offline");
+            }
+
+            if ("HEARTBEAT".equals(metaData)) {
+                return;
+            }
+
+            if (!metaData.startsWith("PREPARE:")) {
                 os.write("REJECT\n".getBytes(StandardCharsets.UTF_8));
                 os.flush();
                 return;
             }
 
             String[] parts = metaData.split(":");
-            String fileName = parts[1];
+            fileName = parts[1];
             long fileSize = Long.parseLong(parts[2]);
 
             AppLogger.info("[OK] Received transfer request | Name: {}, Size: {} bytes", fileName, fileSize);
@@ -324,15 +397,35 @@ public class TcpPunchTransfer {
             os.write("ACCEPT\n".getBytes(StandardCharsets.UTF_8));
             os.flush();
 
-            File destFile = new File(saveDir, fileName);
+            destFile = new File(saveDir, fileName);
             AppLogger.info("Downloading...");
 
-            try (ProgressInputStream progressInputStream = new ProgressInputStream(is, fileName, fileSize, listener)) {
-                Files.copy(progressInputStream, destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            // 💡 彻底修复：废弃无限等待的 Files.copy，改写为高精度的“限制字节读取循环”
+            // 只要接收满 fileSize 字节立刻安全跳出，保证 Socket 长生命周期不断开！ [1, 2]
+            try (ProgressInputStream progressInputStream = new ProgressInputStream(is, fileName, fileSize, listener);
+                 FileOutputStream fos = new FileOutputStream(destFile)) {
+
+                byte[] buffer = new byte[65536]; // 64KB 缓冲区
+                long bytesRemaining = fileSize;
+                while (bytesRemaining > 0) {
+                    int maxToRead = (int) Math.min(buffer.length, bytesRemaining);
+                    int read = progressInputStream.read(buffer, 0, maxToRead);
+                    if (read == -1) {
+                        throw new IOException("Connection broken prematurely; file incomplete");
+                    }
+                    fos.write(buffer, 0, read);
+                    bytesRemaining -= read;
+                }
+                fos.flush();
                 AppLogger.info("[SUCCESS] File [{}] received successfully!", fileName);
             }
         } catch (Exception e) {
-            AppLogger.error("Error occurred while receiving file", e);
+            AppLogger.error("Error occurred while receiving file: " + fileName, e);
+            if (destFile != null && destFile.exists()) {
+                destFile.delete();
+                AppLogger.info("[CLEANUP] Deleted incomplete file: {}", fileName);
+            }
+            throw new RuntimeException(e);
         }
     }
 }

@@ -63,4 +63,7 @@ dependencies {
     implementation("com.google.zxing:core:3.5.3")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("androidx.compose.material:material-icons-extended:1.6.3")
+    // 1. 必须修改这个核心库，这是 LoadingIndicator 组件的真正所在地
+    implementation("androidx.compose.material3:material3:1.5.0-alpha04")
+    implementation("androidx.graphics:graphics-shapes:1.0.1")
 }
