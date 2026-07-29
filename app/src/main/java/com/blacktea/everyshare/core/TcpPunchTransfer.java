@@ -16,18 +16,18 @@ public class TcpPunchTransfer {
     private static final Logger log = LoggerFactory.getLogger(TcpPunchTransfer.class);
     private static final String FAKE_HTTP_HEADER = "GET / HTTP/1.1\r\nHost: %s\r\n\r\n";
 
-    // 不关流的输入流包装器，防止 try-with-resources 自动关闭底层 Socket [1, 2]
+    // 不关流的输入流包装器，防止 try-with-resources 自动关闭底层 Socket
     private static class NonCloseableInputStream extends FilterInputStream {
         public NonCloseableInputStream(InputStream in) {
             super(in);
         }
         @Override
         public void close() throws IOException {
-            // 保持静默，不关闭底层的网络 Socket 流 [1]
+            // 保持静默，不关闭底层的网络 Socket 流
         }
     }
 
-    // 不关流的输出流包装器，重写 write 方法，防止速度阻断 [1, 2]
+    // 不关流的输出流包装器，重写 write 方法，防止速度阻断
     private static class NonCloseableOutputStream extends FilterOutputStream {
         public NonCloseableOutputStream(OutputStream out) {
             super(out);
@@ -45,7 +45,7 @@ public class TcpPunchTransfer {
 
         @Override
         public void close() throws IOException {
-            out.flush(); // 仅执行冲刷，不关闭底层 Socket 流 [1]
+            out.flush(); // 仅执行冲刷，不关闭底层 Socket 流
         }
     }
 
@@ -116,7 +116,8 @@ public class TcpPunchTransfer {
     }
 
     private double alignTimeByUdpWithIp(InetAddress localIp, String remoteIp, int remotePort, int localPort, boolean isMaster, StatusListener statusListener) {
-        if (statusListener != null) statusListener.onStatusUpdate("正在进行 UDP 时延校准...");
+        // 💡 状态对齐：点击连接开始握手时，首先显示为“等待对方连接”，避免任何抢跑闪烁
+        if (statusListener != null) statusListener.onStatusUpdate("等待对方连接");
         AppLogger.info("[UDP] Starting sync and time alignment...");
         double slaveWaitTimeMs = 0;
 
@@ -149,6 +150,9 @@ public class TcpPunchTransfer {
                         byte[] ack = "UDP_HELLO_ACK".getBytes(StandardCharsets.UTF_8);
                         udpSocket.send(new DatagramPacket(ack, ack.length, remoteAddress, remotePort));
                         handshakeConnected = true;
+
+                        // 💡 状态对齐：一旦两端 UDP 手动对齐，安全无闪烁切入“时延校准中”！
+                        if (statusListener != null) statusListener.onStatusUpdate("正在进行 UDP 时延校准...");
                         AppLogger.info("[UDP] Handshake successful, bidirectional channel established!");
                     }
                 } catch (SocketTimeoutException ignored) {}
@@ -227,7 +231,6 @@ public class TcpPunchTransfer {
     }
 
     public Socket connectByPunch(String remoteIp, int remotePort, int localPort, boolean isMaster, boolean useUdpSync, String fakeHttpHost, StatusListener statusListener) {
-        // 1. 在最外层获取并缓存 IP
         InetAddress localIp = getActivePublicIpv6();
         if (localIp == null) {
             try {
@@ -241,11 +244,9 @@ public class TcpPunchTransfer {
             return null;
         }
 
-        // 2. 进行高精度 UDP 引导同步
         if (useUdpSync) {
             double waitTimeMs = alignTimeByUdpWithIp(localIp, remoteIp, remotePort, localPort, isMaster, statusListener);
             if (waitTimeMs > 0) {
-                // 💡 捍卫高精度时钟对齐：去除在这里多余的 1 秒 Thread.sleep，让打洞起跑对准每一毫秒！
                 try { Thread.sleep((long) waitTimeMs); } catch (InterruptedException ignored) {
                     Thread.currentThread().interrupt();
                     return null;
@@ -291,19 +292,22 @@ public class TcpPunchTransfer {
                 os.write(fakeHeader.getBytes(StandardCharsets.UTF_8));
                 os.flush();
 
-                // 双回车 \r\n\r\n 动态检测算法，不限域名长度，清洗得干干净净 [2.1.2]
-                int crlfCount = 0;
+                // 💡 完美有限状态机：严格匹配 \r\n\r\n 报头结束符并安全洗涤 [2.1.2]
+                int state = 0;
                 while (true) {
                     int b = is.read();
                     if (b == -1) throw new IOException("Connection closed prematurely");
-                    char c = (char) b;
-                    if (c == '\r' || c == '\n') {
-                        crlfCount++;
-                        if (crlfCount >= 4) {
-                            break;
-                        }
+
+                    if (state == 0 && b == '\r') {
+                        state = 1;
+                    } else if (state == 1 && b == '\n') {
+                        state = 2;
+                    } else if (state == 2 && b == '\r') {
+                        state = 3;
+                    } else if (state == 3 && b == '\n') {
+                        break;
                     } else {
-                        crlfCount = 0;
+                        state = (b == '\r') ? 1 : 0;
                     }
                 }
 
@@ -326,7 +330,6 @@ public class TcpPunchTransfer {
     }
 
     public void sendFile(Socket socket, InputStream fileStream, String fileName, long fileSize, ProgressListener listener) {
-        // 💡 彻底修复：使用不关流包装器保护 Socket 生命周期 [1, 2]
         try (OutputStream os = new NonCloseableOutputStream(socket.getOutputStream());
              InputStream is = new NonCloseableInputStream(socket.getInputStream());
              ProgressInputStream progressInputStream = new ProgressInputStream(fileStream, fileName, fileSize, listener)) {
@@ -338,7 +341,6 @@ public class TcpPunchTransfer {
             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
             String response = reader.readLine();
 
-            // 💡 彻底修复对端下线误判：如果读取返回 null，说明接收端（对方）已经退出了会话，抛出精准异常 [2]
             if (response == null) {
                 throw new IOException("Connection lost: peer is offline");
             }
@@ -366,14 +368,12 @@ public class TcpPunchTransfer {
     public void receiveFile(Socket socket, String saveDir, ProgressListener listener) {
         File destFile = null;
         String fileName = "unknown";
-        // 💡 彻底修复：使用不关流包装器保护 Socket 生命周期 [1, 2]
         try (InputStream is = new NonCloseableInputStream(socket.getInputStream());
              OutputStream os = new NonCloseableOutputStream(socket.getOutputStream())) {
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
             String metaData = reader.readLine();
 
-            // 💡 彻底修复对端下线误判：如果发送端主动断开，读取为 null，抛出异常 [2]
             if (metaData == null) {
                 throw new IOException("Connection lost: peer is offline");
             }
@@ -400,12 +400,10 @@ public class TcpPunchTransfer {
             destFile = new File(saveDir, fileName);
             AppLogger.info("Downloading...");
 
-            // 💡 彻底修复：废弃无限等待的 Files.copy，改写为高精度的“限制字节读取循环”
-            // 只要接收满 fileSize 字节立刻安全跳出，保证 Socket 长生命周期不断开！ [1, 2]
             try (ProgressInputStream progressInputStream = new ProgressInputStream(is, fileName, fileSize, listener);
                  FileOutputStream fos = new FileOutputStream(destFile)) {
 
-                byte[] buffer = new byte[65536]; // 64KB 缓冲区
+                byte[] buffer = new byte[65536];
                 long bytesRemaining = fileSize;
                 while (bytesRemaining > 0) {
                     int maxToRead = (int) Math.min(buffer.length, bytesRemaining);
