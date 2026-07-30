@@ -16,18 +16,18 @@ public class TcpPunchTransfer {
     private static final Logger log = LoggerFactory.getLogger(TcpPunchTransfer.class);
     private static final String FAKE_HTTP_HEADER = "GET / HTTP/1.1\r\nHost: %s\r\n\r\n";
 
-    // 不关流的输入流包装器，防止 try-with-resources 自动关闭底层 Socket
+    // 不关流的输入流包装器，防止 try-with-resources 自动关闭底层 Socket [1, 2]
     private static class NonCloseableInputStream extends FilterInputStream {
         public NonCloseableInputStream(InputStream in) {
             super(in);
         }
         @Override
         public void close() throws IOException {
-            // 保持静默，不关闭底层的网络 Socket 流
+            // 保持静默，不关闭底层的网络 Socket 流 [1]
         }
     }
 
-    // 不关流的输出流包装器，重写 write 方法，防止速度阻断
+    // 不关流的输出流包装器，重写 write 方法，防止速度阻断 [1, 2]
     private static class NonCloseableOutputStream extends FilterOutputStream {
         public NonCloseableOutputStream(OutputStream out) {
             super(out);
@@ -45,8 +45,31 @@ public class TcpPunchTransfer {
 
         @Override
         public void close() throws IOException {
-            out.flush(); // 仅执行冲刷，不关闭底层 Socket 流
+            out.flush(); // 仅执行冲刷，不关闭底层 Socket 流 [1]
         }
+    }
+
+    public static InetAddress getPublicIpv6FromApi(String apiUrl) {
+        try {
+            AppLogger.info("[IP] 正在通过 API [{}] 请求公网 IPv6...", apiUrl);
+            URL url = new URL(apiUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(2500);
+            conn.setReadTimeout(2500);
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                String ipStr = reader.readLine();
+                if (ipStr != null && !ipStr.trim().isEmpty()) {
+                    String trimmedIp = ipStr.trim();
+                    // 💡 打印彩色成功日志 [2.1.2]
+                    AppLogger.info("[IP] [OK] 成功从 [{}] 获取 IP: {}", apiUrl, trimmedIp);
+                    return InetAddress.getByName(trimmedIp);
+                }
+            }
+        } catch (Exception e) {
+            // 💡 打印失败日志，帮你排查是否是 DNS 未就绪 [2.1.2]
+            AppLogger.info("[IP] [WARN] API [{}] 请求失败: {}", apiUrl, e.getMessage());
+        }
+        return null;
     }
 
     public static InetAddress getActivePublicIpv6() {
@@ -292,7 +315,7 @@ public class TcpPunchTransfer {
                 os.write(fakeHeader.getBytes(StandardCharsets.UTF_8));
                 os.flush();
 
-                // 💡 完美有限状态机：严格匹配 \r\n\r\n 报头结束符并安全洗涤 [2.1.2]
+                // 💡 完美有限状态机：严格单字节匹配并有序清洗 \r\n\r\n 报头结束符并安全洗涤 [2.1.2]
                 int state = 0;
                 while (true) {
                     int b = is.read();

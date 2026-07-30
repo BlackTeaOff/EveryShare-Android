@@ -53,6 +53,8 @@ import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.LoadingIndicator
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.getValue
@@ -64,6 +66,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -94,21 +97,26 @@ import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.CompletableDeferred
 import java.io.File
 import java.io.FileInputStream
 import java.net.Socket
+import java.util.Objects
 import kotlin.concurrent.thread
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.net.InetAddress
 
 enum class ActiveTab { TRANSFER, SETTINGS }
 enum class SessionState { IDLE, CONNECTING, ACTIVE }
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
 enum class AppTheme { LAVENDER, SAGE, SLATE, OAT }
+enum class PillState { HIDDEN, POP_CIRCLE, EXTEND_PILL }
 
 class MainActivity : ComponentActivity() {
     private val TAG = "EveryShare"
@@ -373,6 +381,52 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // 💡 状态：智能药丸（Smart Pill）状态机及显示文本
+        var pillState by remember { mutableStateOf(PillState.HIDDEN) }
+        var pillText by remember { mutableStateOf("") }
+
+        // 💡 智能药丸自动化生命周期监听一：网络定位阶段
+        LaunchedEffect(myIpv6Text.value) {
+            if (myIpv6Text.value == "连接中...") {
+                pillText = "正在定位公网 IP"
+                pillState = PillState.POP_CIRCLE
+                delay(1000) // 💡 完美停顿：等待 1 秒，等小圆果冻回弹完全静止后再平滑延伸
+                pillState = PillState.EXTEND_PILL
+            } else if (myIpv6Text.value != "连接中..." && myIpv6Text.value != "未连接") {
+                pillText = "公网 IP 定位成功"
+                pillState = PillState.EXTEND_PILL
+                delay(2500) // 显示 2.5 秒后自动缩回并隐藏
+                pillState = PillState.POP_CIRCLE
+                delay(600) // 💡 物理平滑等待：等 600ms 正圆收缩动画彻底放完，再触发 Hidden 退出淡出！
+                pillState = PillState.HIDDEN
+            } else if (myIpv6Text.value == "未连接") {
+                pillText = "公网 IP 定位失败"
+                pillState = PillState.EXTEND_PILL
+                delay(2500)
+                pillState = PillState.POP_CIRCLE
+                delay(600)
+                pillState = PillState.HIDDEN
+            }
+        }
+
+        // 💡 智能药丸自动化生命周期监听二：传输连接阶段
+        LaunchedEffect(isTransferring.value, statusText.value) {
+            if (isTransferring.value) {
+                pillText = statusText.value
+                if (pillState == PillState.HIDDEN) {
+                    pillState = PillState.POP_CIRCLE
+                    delay(1000) // 💡 弹起圆点，静止 1 秒
+                }
+                pillState = PillState.EXTEND_PILL
+            } else {
+                if (pillState == PillState.EXTEND_PILL) {
+                    pillState = PillState.POP_CIRCLE
+                    delay(600) // 💡 等待缩圆
+                    pillState = PillState.HIDDEN
+                }
+            }
+        }
+
         LaunchedEffect(myCode.value) {
             if (myCode.value.startsWith("everyshare://")) {
                 withContext(Dispatchers.IO) {
@@ -384,7 +438,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // 💡 反应式互传码生成器：当角色切换、网卡变化或端口变换时，自动反应并重写正确的 1 字节角色标识 [1]
+        // 💡 反应式互传码生成器
         LaunchedEffect(isSenderRole.value, myIpv6Text.value, myPort.value) {
             if (myIpv6Text.value != "连接中..." && myIpv6Text.value != "未连接") {
                 val rawIp = myIpv6Text.value.split("\n")[0]
@@ -425,16 +479,33 @@ class MainActivity : ComponentActivity() {
             myCode.value = "正在定位公网 IP..."
 
             resetIpJob = scope.launch(Dispatchers.IO) {
-                delay(400)
+                // 1. 💡 物理稳定等待：将 400ms 延长至 1000ms，给手机天线和基站充足的握手时间
+                delay(1000)
                 try {
-                    val myIpv6 = withTimeoutOrNull(4000) {
-                        TcpPunchTransfer.getActivePublicIpv6()
+                    val apis = listOf("https://api6.ipify.org", "https://v6.ident.me")
+
+                    // 2. 第一次尝试并行竞争获取
+                    var myIpv6 = withTimeoutOrNull(3000) {
+                        raceFetchIpv6(apis)
+                    }
+
+                    // 3. 💡 容错二次重试：如果第一次没拿到（可能是因为 DNS 还没好），我们等 1.5 秒再给它一次机会！
+                    if (myIpv6 == null) {
+                        AppLogger.info("[IP] 首次定位失败，网络可能尚未完全就绪。正在等待 1.5 秒后进行第二次尝试...")
+                        delay(1500)
+                        myIpv6 = withTimeoutOrNull(3000) {
+                            raceFetchIpv6(apis)
+                        }
                     }
 
                     if (myIpv6 != null) {
                         val randomPort = 50000 + (Math.random() * 10000).toInt()
                         myPort.value = randomPort
-                        val generatedCode = ConnectionCodeUtil.generateCode(myIpv6.hostAddress, randomPort, if (isSenderRole.value) 0 else 1)
+                        val generatedCode = ConnectionCodeUtil.generateCode(
+                            myIpv6.hostAddress,
+                            randomPort,
+                            if (isSenderRole.value) 0 else 1
+                        )
 
                         val localIps = TcpPunchTransfer.getLocalIPv6List()
                         val isNat6 = !localIps.contains(myIpv6.hostAddress.lowercase())
@@ -450,6 +521,7 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 } catch (e: Exception) {
+                    AppLogger.error("并行定位公网 IP 异常", e)
                     withContext(Dispatchers.Main) {
                         myIpv6Text.value = "未连接"
                         myCode.value = "定位失败"
@@ -613,14 +685,35 @@ class MainActivity : ComponentActivity() {
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     if (state == SessionState.IDLE) {
-                                        Text(
-                                            text = "EveryShare",
-                                            fontSize = 32.sp,
-                                            fontWeight = FontWeight.Black,
-                                            color = MaterialTheme.colorScheme.onBackground,
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp),
-                                            textAlign = TextAlign.Start
-                                        )
+                                        // 💡 主页纯净：右上角只留灵动药丸 (SmartPill)，完全解耦
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .animateContentSize(
+                                                    animationSpec = spring(
+                                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                                        stiffness = Spring.StiffnessLow
+                                                    )
+                                                ),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "EveryShare",
+                                                fontSize = 32.sp,
+                                                fontWeight = FontWeight.Black,
+                                                color = MaterialTheme.colorScheme.onBackground,
+                                                modifier = Modifier.padding(horizontal = 6.dp)
+                                            )
+
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                SmartPillShell(state = pillState, text = pillText)
+                                                Spacer(modifier = Modifier.width(6.dp)) // 💡 物理安全边距，彻底防右边缘裁切
+                                            }
+                                        }
 
                                         Card(
                                             modifier = Modifier.fillMaxWidth(),
@@ -730,7 +823,6 @@ class MainActivity : ComponentActivity() {
                                                         Text(text = myPort.value.toString(), fontSize = 18.sp, fontWeight = FontWeight.Bold, color = cardTextColor)
                                                     }
                                                 }
-                                                // 💡 联动机制实现：点击主页“传输策略”卡片，自动平滑跳转至设置界面并展开
                                                 Card(
                                                     modifier = Modifier
                                                         .fillMaxWidth()
@@ -831,7 +923,14 @@ class MainActivity : ComponentActivity() {
                                         //               「连接配对」界面
                                         // ==========================================
                                         Row(
-                                            modifier = Modifier.fillMaxWidth(),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .animateContentSize(
+                                                    animationSpec = spring(
+                                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                                        stiffness = Spring.StiffnessLow
+                                                    )
+                                                ),
                                             horizontalArrangement = Arrangement.SpaceBetween,
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
@@ -842,7 +941,10 @@ class MainActivity : ComponentActivity() {
                                                 color = MaterialTheme.colorScheme.onBackground
                                             )
 
-                                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
                                                 IconButton(
                                                     onClick = {
                                                         val options = ScanOptions().apply {
@@ -854,7 +956,7 @@ class MainActivity : ComponentActivity() {
                                                         }
                                                         scanLauncher.launch(options)
                                                     },
-                                                    enabled = !isTransferring.value // 💡 开始连接后禁用
+                                                    enabled = !isTransferring.value
                                                 ) {
                                                     Icon(
                                                         imageVector = Icons.Default.QrCodeScanner,
@@ -866,7 +968,7 @@ class MainActivity : ComponentActivity() {
                                                     onClick = {
                                                         galleryLauncher.launch("image/*")
                                                     },
-                                                    enabled = !isTransferring.value // 💡 开始连接后禁用
+                                                    enabled = !isTransferring.value
                                                 ) {
                                                     Icon(
                                                         imageVector = Icons.Default.PhotoLibrary,
@@ -874,6 +976,10 @@ class MainActivity : ComponentActivity() {
                                                         tint = if (isTransferring.value) cardTextColor.copy(alpha = 0.4f) else cardTextColor
                                                     )
                                                 }
+
+                                                // 💡 配对页右上角：药丸放置在扫码和相册的右侧
+                                                SmartPillShell(state = pillState, text = pillText)
+                                                Spacer(modifier = Modifier.width(6.dp)) // 💡 物理安全边距，防止回弹时右侧切边
                                             }
                                         }
 
@@ -981,7 +1087,7 @@ class MainActivity : ComponentActivity() {
                                             }
                                         }
 
-                                        // 连接配对 Bento 一体化卡片
+                                        // 连接配对 Bento 卡片
                                         Card(
                                             modifier = Modifier.fillMaxWidth(),
                                             shape = RoundedCornerShape(24.dp),
@@ -1005,7 +1111,7 @@ class MainActivity : ComponentActivity() {
                                                         fontWeight = FontWeight.Bold
                                                     )
 
-                                                    // 纯圆形一键粘贴按键，Canvas 手绘
+                                                    // 一键粘贴圆形按键
                                                     Box(
                                                         modifier = Modifier
                                                             .size(36.dp)
@@ -1054,30 +1160,26 @@ class MainActivity : ComponentActivity() {
                                                         focusedBorderColor = MaterialTheme.colorScheme.primary,
                                                         unfocusedBorderColor = Color.LightGray.copy(alpha = 0.5f)
                                                     ),
-                                                    enabled = !isTransferring.value // 开始连接后禁用输入框
+                                                    enabled = !isTransferring.value
                                                 )
 
-                                                // 💡 一键变形药丸按钮：未连接显示“开始连接”，连接中变为“取消连接”
+                                                // 💡 一键变形药丸按钮
                                                 Button(
                                                     onClick = {
                                                         if (isTransferring.value) {
-                                                            // 💡 状态重载：如果在连接等待中被点击，执行一键安全返回并关闭 Socket 进程！
                                                             cancelActiveTransfer()
                                                         } else {
                                                             if (remoteCode.value.isBlank()) return@Button
-
-                                                            // 💡 物理防御：自己不能连接自己 (使用 Toast 直接静默拦截，不触发不和谐错误状态卡) [1]
                                                             if (remoteCode.value.trim() == myCode.value.trim()) {
                                                                 android.widget.Toast.makeText(context, "不能连接到自己", android.widget.Toast.LENGTH_SHORT).show()
                                                                 return@Button
                                                             }
 
-                                                            // 💡 物理防御：接收解析 19 字节角色并核对是否冲突 [1]
                                                             try {
                                                                 val parsedInfo = ConnectionCodeUtil.parseCode(remoteCode.value)
                                                                 val myRoleInt = if (isSenderRole.value) 0 else 1
                                                                 if (parsedInfo.role == myRoleInt) {
-                                                                    statusText.value = "连接失败：双方角色冲突" // 💡 双方角色冲突：写入状态卡展示，不弹 Toast！ [5]
+                                                                    statusText.value = "连接失败：双方角色冲突"
                                                                     isTransferring.value = false
                                                                     return@Button
                                                                 }
@@ -1165,7 +1267,7 @@ class MainActivity : ComponentActivity() {
                                                     },
                                                     shape = CircleShape,
                                                     modifier = Modifier.width(160.dp).height(44.dp),
-                                                    enabled = remoteCode.value.isNotBlank(), // 💡 发送期间不用置灰，因为它身兼“取消连接”的功能！ [1]
+                                                    enabled = remoteCode.value.isNotBlank(),
                                                     colors = ButtonDefaults.buttonColors(
                                                         containerColor = if (isTransferring.value) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
                                                     )
@@ -1179,7 +1281,6 @@ class MainActivity : ComponentActivity() {
                                             }
                                         }
 
-                                        // 💡 智能显隐状态卡：当处于传输中，或者状态栏包含“连接失败”报错时，卡片必须平滑在眼前拉开！
                                         val isErrorState = statusText.value.startsWith("连接失败")
                                         AnimatedVisibility(
                                             visible = isTransferring.value || isErrorState,
@@ -1197,13 +1298,13 @@ class MainActivity : ComponentActivity() {
                                                     verticalAlignment = Alignment.CenterVertically,
                                                     horizontalArrangement = Arrangement.spacedBy(16.dp)
                                                 ) {
-                                                    // 💡 修复后（使用 Material 官方原生错误图标，并绑定 M3 主题错误红）：
                                                     if (isErrorState) {
+                                                        // 💡 替换为 Material3 官方原生组件和主题错误红
                                                         Icon(
-                                                            imageVector = Icons.Default.Cancel, // 👈 官方标准的圆圈交叉图标（或换成 Icons.Default.Error 变感叹号）
+                                                            imageVector = Icons.Default.Cancel,
                                                             contentDescription = "Error Connection",
-                                                            tint = MaterialTheme.colorScheme.error, // 👈 优雅地绑定当前主题的警告/错误红色
-                                                            modifier = Modifier.size(54.dp) // 保持 54.dp 的完美比例
+                                                            tint = MaterialTheme.colorScheme.error,
+                                                            modifier = Modifier.size(54.dp)
                                                         )
                                                     } else if (connectionProgress < 0f) {
                                                         @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -1258,6 +1359,34 @@ class MainActivity : ComponentActivity() {
 
                                         Spacer(modifier = Modifier.height(10.dp))
 
+                                        // 💡 双排大图标组合：左侧为灵动药丸 (SmartPill)，右侧为会话网络状况
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .animateContentSize(
+                                                    animationSpec = spring(
+                                                        dampingRatio = Spring.DampingRatioMediumBouncy,
+                                                        stiffness = Spring.StiffnessLow
+                                                    )
+                                                ),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                text = "● 已建立安全隧道 | RTT: 测量中...",
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize = 10.sp,
+                                                color = Color.Gray,
+                                                modifier = Modifier.padding(horizontal = 6.dp)
+                                            )
+
+                                            // 💡 传输中在右上角常驻展示灵动药丸
+                                            SmartPillShell(state = pillState, text = pillText)
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                        }
+
+                                        Spacer(modifier = Modifier.height(6.dp))
+
                                         if (isSenderRole.value) {
                                             Card(
                                                 modifier = Modifier.fillMaxWidth().bounceClick {
@@ -1282,6 +1411,10 @@ class MainActivity : ComponentActivity() {
                                             Button(
                                                 onClick = {
                                                     if (activeSocket.value == null || selectedFileUri.value == null || isCachingFile.value) return@Button
+                                                    if (remoteCode.value.trim() == myCode.value.trim()) {
+                                                        android.widget.Toast.makeText(context, "不能连接到自己", android.widget.Toast.LENGTH_SHORT).show()
+                                                        return@Button
+                                                    }
                                                     isTransferring.value = true
                                                     statusText.value = "正在通过已建立通道上传..."
 
@@ -1328,7 +1461,7 @@ class MainActivity : ComponentActivity() {
                                         Spacer(modifier = Modifier.weight(1f))
 
                                         Button(
-                                            onClick = { showExitDialog = true },
+                                            onClick = { cancelActiveTransfer() },
                                             modifier = Modifier.fillMaxWidth(),
                                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                                         ) {
@@ -1350,7 +1483,7 @@ class MainActivity : ComponentActivity() {
                                 textAlign = TextAlign.Start
                             )
 
-                            // 💡 1. 3D 翻转多彩 Logo 品牌卡片（Settings 最顶端）[1, 1.1.2]
+                            // 💡 1. 3D 翻转多彩 Logo 品牌卡片移至 Settings 最顶端
                             val logoCardRotationY by animateFloatAsState(
                                 targetValue = if (logoFlipped) 180f else 0f,
                                 animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
@@ -1378,7 +1511,6 @@ class MainActivity : ComponentActivity() {
                                         }
                                     },
                                 shape = RoundedCornerShape(24.dp),
-                                // 💡 视觉完全相容：深色模式直接采用 cardBg，浅色完全透明
                                 colors = CardDefaults.cardColors(containerColor = if (isDark) cardBg else Color.Transparent),
                                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                             ) {
@@ -1399,13 +1531,13 @@ class MainActivity : ComponentActivity() {
                                         )
                                         Spacer(modifier = Modifier.height(10.dp))
                                         Text(
-                                            text = "EveryShare", // 💡 正反面都是 EveryShare
+                                            text = "EveryShare",
                                             fontSize = 20.sp,
                                             fontWeight = FontWeight.Black,
                                             color = cardTextColor
                                         )
                                         Text(
-                                            text = "v0.1.0-alpha", // 💡 统一版本号为 v0.1.0-alpha [3]
+                                            text = "v0.1.0-alpha",
                                             fontSize = 11.sp,
                                             color = Color.Gray
                                         )
@@ -1681,7 +1813,6 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
 
-                            // 💡 DPI 流量伪装域名设置
                             var showFakeHttpDetail by remember { mutableStateOf(false) }
                             val fakeHttpArrowRotation by animateFloatAsState(
                                 targetValue = if (showFakeHttpDetail) 180f else 0f,
@@ -1741,7 +1872,6 @@ class MainActivity : ComponentActivity() {
                                                     colors = OutlinedTextFieldDefaults.colors(
                                                         disabledTextColor = cardTextColor,
                                                         disabledLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                        // 💡 修复后：补全了中间的 .colorScheme 属性调用
                                                         disabledBorderColor = MaterialTheme.colorScheme.outline,
                                                         disabledContainerColor = Color.Transparent
                                                     ),
@@ -1837,7 +1967,7 @@ class MainActivity : ComponentActivity() {
                                                         horizontalArrangement = Arrangement.SpaceBetween,
                                                         verticalAlignment = Alignment.CenterVertically
                                                     ) {
-                                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                                        Row(verticalAlignment = Objects.requireNonNull(Alignment.CenterVertically)) {
                                                             Image(
                                                                 painter = painterResource(id = R.drawable.avatar),
                                                                 contentDescription = "Avatar",
@@ -2121,6 +2251,99 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// 💡 智能药丸（SmartPill）动画外壳包装器
+@Composable
+fun SmartPillShell(state: PillState, text: String) {
+    AnimatedVisibility(
+        visible = state != PillState.HIDDEN,
+        enter = fadeIn(animationSpec = tween(100)) + scaleIn(
+            animationSpec = spring(
+                // 💡 核心优化：将 MediumBouncy 改为 LowBouncy（低弹性）
+                // 这样药丸会有一个非常高级、克制的微弱回弹，既保持了Q弹感，又绝对不会超出边界 [2.1.2]
+                dampingRatio = Spring.DampingRatioLowBouncy,
+                stiffness = Spring.StiffnessMedium
+            ),
+            initialScale = 0f
+        ),
+        exit = fadeOut(animationSpec = tween(300)) + scaleOut(
+            animationSpec = tween(300),
+            targetScale = 0f
+        ) + shrinkHorizontally(
+            animationSpec = tween(300)
+        )
+    ) {
+        SmartPill(state = state, text = text)
+    }
+}
+
+// 💡 智能药丸（SmartPill）内部实现组件
+@Composable
+fun SmartPill(state: PillState, text: String) {
+    val pillWidthModifier = when (state) {
+        PillState.HIDDEN -> Modifier.width(36.dp)
+        PillState.POP_CIRCLE -> Modifier.width(36.dp)
+        PillState.EXTEND_PILL -> Modifier.wrapContentWidth()
+    }
+
+    Box(
+        modifier = Modifier
+            .height(36.dp)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.primary)
+            // 💡 1. 唯一尺寸动画控制：缩短至 450ms，动作更加清爽、干脆
+            .animateContentSize(
+                animationSpec = tween(
+                    durationMillis = 450,
+                    easing = androidx.compose.animation.core.FastOutSlowInEasing
+                )
+            )
+            .then(pillWidthModifier)
+            // 💡 2. 核心修复：彻底干掉动画边距，使用固定的 8.dp 黄金常数！
+            // 完美适配正圆居中与长条对称，彻底解决双重动画导致的粘滞感与抖动 [2.1.2]
+            .padding(horizontal = 8.dp),
+        contentAlignment = Alignment.CenterStart // 左侧物理锚点固定
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Start,
+            modifier = Modifier.fillMaxHeight()
+        ) {
+            // 左侧加载圆圈：因为左边距永远是 8.dp，它在动画全程中会绝对静止在左侧！
+            Box(
+                modifier = Modifier.size(20.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                @OptIn(ExperimentalMaterial3ExpressiveApi::class)
+                LoadingIndicator(
+                    modifier = Modifier.size(16.dp),
+                    color = Color.White
+                )
+            }
+
+            if (state == PillState.EXTEND_PILL) {
+                Spacer(modifier = Modifier.width(6.dp))
+                AnimatedContent(
+                    targetState = text,
+                    transitionSpec = {
+                        (slideInVertically { height -> height } + fadeIn(animationSpec = tween(150)))
+                            .togetherWith(slideOutVertically { height -> -height } + fadeOut(animationSpec = tween(150)))
+                    },
+                    label = "PillText"
+                ) { targetText ->
+                    Text(
+                        text = targetText,
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        modifier = Modifier.clip(CircleShape)
+                    )
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun ThemeIcon(
     points: Int,
@@ -2201,6 +2424,42 @@ fun ThemeModePill(
     }
 }
 
+/**
+ * 💡 核心算法：并行网络竞争获取 IPv6
+ * 多个 API 同时请求，谁最快返回谁
+ */
+private suspend fun raceFetchIpv6(apis: List<String>): InetAddress? = coroutineScope {
+    // 一个用于接收第一个成功的异步结果的容器
+    val deferredResult = CompletableDeferred<InetAddress>()
+
+    // 启动与 API 数量相等的并发任务
+    val jobs = apis.map { api ->
+        launch(Dispatchers.IO) {
+            try {
+                // 每一个任务都在后台独立请求
+                val ip = TcpPunchTransfer.getPublicIpv6FromApi(api)
+                if (ip != null) {
+                    // 抢答成功！第一个塞入结果的任务会触发 complete
+                    deferredResult.complete(ip)
+                }
+            } catch (ignored: Exception) {
+                // 失败了无所谓，等其他兄弟任务完成
+            }
+        }
+    }
+
+    try {
+        // 挂起并等待第一个抢答成功的 IP
+        deferredResult.await()
+    } catch (e: Exception) {
+        null
+    } finally {
+        // 💡 关键：一旦拿到第一名（或者超时退出），立刻在后台杀死所有其他还在请求的顽固任务！
+        // 释放手机 socket 资源和流量
+        jobs.forEach { it.cancel() }
+    }
+}
+
 fun Modifier.bounceClick(onClick: () -> Unit): Modifier = composed {
     var rotationX by remember { mutableStateOf(0f) }
     var rotationY by remember { mutableStateOf(0f) }
@@ -2237,6 +2496,7 @@ fun Modifier.bounceClick(onClick: () -> Unit): Modifier = composed {
                 val deltaX = (offset.x - centerX) / centerX
                 val deltaY = (offset.y - centerY) / centerY
 
+                // 💡 按压物理角度恢复：完全还原为用户首选、符合直觉的最早版本
                 rotationY = deltaX * 24f
                 rotationX = -deltaY * 24f
                 scale = 0.94f
@@ -2259,6 +2519,7 @@ fun Modifier.bounceClick(onClick: () -> Unit): Modifier = composed {
         this.scaleX = animScale
         this.scaleY = animScale
         this.alpha = animAlpha
+        // 💡 物理深度透视：恢复最舒适平稳的 16f 视差 [1]
         this.cameraDistance = 16f * density
     }
 }
