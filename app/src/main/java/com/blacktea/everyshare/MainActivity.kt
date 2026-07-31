@@ -116,6 +116,9 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.ui.unit.Dp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 enum class ActiveTab { TRANSFER, SETTINGS }
 enum class SessionState { IDLE, CONNECTING, ACTIVE }
@@ -128,6 +131,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 💡 动态申请 Android 13+ 必配的发送通知权限，否则前台服务会在启动时崩溃
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+        }
+
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
 
@@ -487,26 +496,31 @@ class MainActivity : ComponentActivity() {
         }
 
         fun resetMyConnectionCode() {
-            resetIpJob?.cancel()
+            resetIpJob?.cancel() // 💡 杀掉前一个，实现防抖
             myIpv6Text.value = "连接中..."
             myCode.value = "正在定位公网 IP..."
 
             resetIpJob = scope.launch(Dispatchers.IO) {
-                // 1. 💡 物理稳定等待：将 400ms 延长至 1000ms，给手机天线和基站充足的握手时间
-                delay(1000)
+                // 💡 1. 黄金防抖时间：给网卡、基站和 DNS 1.2 秒的物理就绪和稳定时间
+                delay(1200)
                 try {
-                    val apis = listOf("https://api6.ipify.org", "https://v6.ident.me")
+                    // 💡 修改你的 MainActivity.kt 里的 apis 列表：
+                    val apis = listOf(
+                        "https://ipv6.icanhazip.com",    // 2. 微软/Cloudflare 顶级 CDN，全球最稳
+                        "https://v6.ident.me",      // 3. 经典备用
+                        "https://api6.ipify.org"     // 4. 经典备用
+                    )
 
-                    // 2. 第一次尝试并行竞争获取
-                    var myIpv6 = withTimeoutOrNull(3000) {
+                    // 第一次尝试（因为有了 1.2s 的防抖，这一次的成功率将极高）
+                    var myIpv6 = withTimeoutOrNull(2500) {
                         raceFetchIpv6(apis)
                     }
 
-                    // 3. 💡 容错二次重试：如果第一次没拿到（可能是因为 DNS 还没好），我们等 1.5 秒再给它一次机会！
+                    // 第二次容错重试（只有在极端差网、或者 1.2s 仍未就绪时才触发）
                     if (myIpv6 == null) {
                         AppLogger.info("[IP] 首次定位失败，网络可能尚未完全就绪。正在等待 1.5 秒后进行第二次尝试...")
                         delay(1500)
-                        myIpv6 = withTimeoutOrNull(3000) {
+                        myIpv6 = withTimeoutOrNull(2500) {
                             raceFetchIpv6(apis)
                         }
                     }
@@ -559,33 +573,12 @@ class MainActivity : ComponentActivity() {
                     remoteCode.value = ""
                 }
 
+                try {
+                    context.stopService(Intent(context, EveryShareService::class.java))
+                } catch (ignored: Exception) {}
+
                 try { Thread.sleep(500) } catch (ignored: Exception) {}
                 resetMyConnectionCode()
-            }
-        }
-
-        // 💡 自动心跳守护协程：只要在 ACTIVE 状态下且自己是发送端，每 15 秒往对方发一次 HEARTBEAT [1]
-        LaunchedEffect(sessionState.value) {
-            if (sessionState.value == SessionState.ACTIVE && isSenderRole.value) {
-                while (activeSocket.value != null && !activeSocket.value!!.isClosed) {
-                    delay(15000) // 每 15 秒心跳一次，刚好能瞒过运营商的防火墙 [1]
-                    try {
-                        withContext(Dispatchers.IO) {
-                            val os = activeSocket.value?.getOutputStream()
-                            // 发送心跳包
-                            os?.write("HEARTBEAT\n".toByteArray(Charsets.UTF_8))
-                            os?.flush()
-                        }
-                    } catch (e: Exception) {
-                        // 心跳发送失败（说明通道已经断了），立即触发断开
-                        this@MainActivity.runOnUiThread {
-                            statusText.value = "连接已断开"
-                        }
-                        delay(2000)
-                        cancelActiveTransfer()
-                        break
-                    }
-                }
             }
         }
 
@@ -625,29 +618,9 @@ class MainActivity : ComponentActivity() {
                 selectedFileName.value = name
                 selectedFileSize.value = size
 
-                isCachingFile.value = true
-                statusText.value = "正在后台缓存文件，请稍候..."
-                thread {
-                    try {
-                        val tempFile = File(context.cacheDir, "temp_upload.dat")
-                        context.contentResolver.openInputStream(uri).use { input ->
-                            if (input != null) {
-                                java.nio.file.Files.copy(input, tempFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                            }
-                        }
-                        this@MainActivity.runOnUiThread {
-                            statusText.value = "文件就绪: $name"
-                            isCachingFile.value = false
-                        }
-                    } catch (e: Exception) {
-                        AppLogger.error("缓存文件失败", e)
-                        this@MainActivity.runOnUiThread {
-                            statusText.value = "缓存失败"
-                            isCachingFile.value = false
-                            selectedFileUri.value = null
-                        }
-                    }
-                }
+                // 💡 0毫秒就绪：不再进行任何后台 Files.copy 复制！
+                statusText.value = "文件就绪: $name"
+                isCachingFile.value = false
             }
         }
 
@@ -1270,6 +1243,44 @@ class MainActivity : ComponentActivity() {
                                                                             statusText.value = if (isSenderRole.value) "等待选择文件..." else "等待对方发送文件..."
                                                                         }
 
+                                                                        // 💡 启动前台服务：向 Android 宣誓主权，要求其在选文件时保持 CPU 和网卡绝对活跃！ [2]
+                                                                        try {
+                                                                            val serviceIntent = Intent(this@MainActivity, EveryShareService::class.java)
+                                                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                                                                startForegroundService(serviceIntent)
+                                                                            } else {
+                                                                                startService(serviceIntent)
+                                                                            }
+                                                                        } catch (e: Exception) {
+                                                                            AppLogger.error("启动前台守护服务失败", e)
+                                                                        }
+
+
+                                                                        // 💡 核心修复：在这里启动一个不受 Android UI 限制的纯 Java 后台守护线程发送心跳 [1, 2]
+                                                                        if (isSenderRole.value) {
+                                                                            thread(isDaemon = true) {
+                                                                                val socket = activeSocket.value
+                                                                                while (socket != null && !socket.isClosed) {
+                                                                                    try {
+                                                                                        Thread.sleep(15000) // 15秒一跳 [1]
+                                                                                        val os = socket.getOutputStream()
+                                                                                        os.write("HEARTBEAT\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                                                                        os.flush()
+                                                                                        Log.d("EveryShare", "发送端后台心跳成功...")
+                                                                                    } catch (e: Exception) {
+                                                                                        AppLogger.error("后台心跳失败，连接已断开", e)
+                                                                                        this@MainActivity.runOnUiThread {
+                                                                                            statusText.value = "连接已断开"
+                                                                                            isTransferring.value = false
+                                                                                        }
+                                                                                        try { Thread.sleep(2000) } catch (ignored: Exception) {}
+                                                                                        cancelActiveTransfer()
+                                                                                        break
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+
                                                                         sessionState.value = SessionState.ACTIVE
 
                                                                         if (!isSenderRole.value) {
@@ -1291,14 +1302,15 @@ class MainActivity : ComponentActivity() {
                                                                             }
 
                                                                             while (activeSocket.value != null && !activeSocket.value!!.isClosed) {
-                                                                                puncher.receiveFile(socket, saveDir, rxListener)
-
-                                                                                // 💡 传输完毕后的重置与去 Emoji 文案修改 [5]
-                                                                                this@MainActivity.runOnUiThread {
-                                                                                    isTransferring.value = false // 💡 传输成功后，变回 LoadingIndicator
-                                                                                    statusText.value = "接收成功，已存入Download/EveryShare" // 💡 去除 Emoji 后的新文案
-                                                                                    progressPercent.value = 0
-                                                                                    currentSpeed.value = 0.0
+                                                                                // 💡 2. 只有在真正接收到文件（返回 true）时，才显示接收成功
+                                                                                val receivedSuccess = puncher.receiveFile(socket, saveDir, rxListener)
+                                                                                if (receivedSuccess) {
+                                                                                    this@MainActivity.runOnUiThread {
+                                                                                        isTransferring.value = false
+                                                                                        statusText.value = "接收成功，已存入Download/EveryShare"
+                                                                                        progressPercent.value = 0
+                                                                                        currentSpeed.value = 0.0
+                                                                                    }
                                                                                 }
                                                                             }
                                                                         }
@@ -1545,7 +1557,7 @@ class MainActivity : ComponentActivity() {
                                             if (isSenderRole.value) {
                                                 Button(
                                                     onClick = {
-                                                        if (activeSocket.value == null || selectedFileUri.value == null || isCachingFile.value) return@Button
+                                                        if (activeSocket.value == null || selectedFileUri.value == null) return@Button
                                                         isTransferring.value = true
                                                         statusText.value = "正在上传文件..."
 
@@ -1557,17 +1569,22 @@ class MainActivity : ComponentActivity() {
                                                                     currentSpeed.value = speed
                                                                     statusText.value = "正在发送: $name"
                                                                 }
-                                                                val tempCacheFile = File(context.cacheDir, "temp_upload.dat")
-                                                                FileInputStream(tempCacheFile).use { fileInputStream ->
-                                                                    puncher.sendFile(activeSocket.value!!, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
+
+                                                                // 💡 核心优化：直接从 Android 系统获取该 URI 的输入流，直接喂给 Java 引擎！ [1, 2]
+                                                                context.contentResolver.openInputStream(selectedFileUri.value!!).use { fileInputStream ->
+                                                                    if (fileInputStream != null) {
+                                                                        puncher.sendFile(activeSocket.value!!, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
+                                                                    } else {
+                                                                        throw java.io.IOException("无法打开文件输入流")
+                                                                    }
                                                                 }
+
                                                                 AppLogger.info("🎉 文件发送完成！")
                                                                 this@MainActivity.runOnUiThread {
                                                                     statusText.value = "等待选择文件..."
                                                                 }
                                                             } catch (e: Exception) {
                                                                 AppLogger.error("发送出错", e)
-                                                                // 💡 异常发生，提示并断开
                                                                 this@MainActivity.runOnUiThread {
                                                                     statusText.value = "连接已断开"
                                                                     isTransferring.value = false
@@ -2145,14 +2162,35 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                // 💡 优化：将日志标题、一键复制、展开折叠整齐排布
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(text = "运行日志", fontSize = 13.sp, color = Color.Gray)
-                    TextButton(onClick = { showLogs.value = !showLogs.value }) {
-                        Text(text = if (showLogs.value) "隐藏日志" else "展开日志", fontSize = 12.sp)
+
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // 💡 新增：一键复制日志按钮 [1]
+                        TextButton(
+                            onClick = {
+                                val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                val allLogs = logList.joinToString("\n")
+                                val clipData = ClipData.newPlainText("EveryShare_Logs", allLogs)
+                                clipboardManager.setPrimaryClip(clipData)
+                                android.widget.Toast.makeText(context, "日志已一键复制到剪贴板！", android.widget.Toast.LENGTH_SHORT).show()
+                            },
+                            enabled = logList.isNotEmpty()
+                        ) {
+                            Text(text = "一键复制", fontSize = 12.sp)
+                        }
+
+                        TextButton(onClick = { showLogs.value = !showLogs.value }) {
+                            Text(text = if (showLogs.value) "隐藏日志" else "展开日志", fontSize = 12.sp)
+                        }
                     }
                 }
 
@@ -2170,20 +2208,19 @@ class MainActivity : ComponentActivity() {
                             .border(1.dp, consoleBorder, RoundedCornerShape(14.dp))
                             .padding(8.dp)
                     ) {
-                        SelectionContainer {
-                            LazyColumn(
-                                state = logListState,
-                                modifier = Modifier.fillMaxSize(),
-                                verticalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                items(logList) { logLine ->
-                                    Text(
-                                        text = logLine,
-                                        color = if (logLine.contains("[ERROR]")) Color.Red else consoleTextColor,
-                                        fontSize = 10.sp,
-                                        fontFamily = FontFamily.Monospace
-                                    )
-                                }
+                        // 💡 彻底删去了外层的 SelectionContainer，完美解决快速刷屏时的闪退 Bug
+                        LazyColumn(
+                            state = logListState,
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            items(logList) { logLine ->
+                                Text(
+                                    text = logLine,
+                                    color = if (logLine.contains("[ERROR]")) Color.Red else consoleTextColor,
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
                             }
                         }
                     }
@@ -2629,38 +2666,42 @@ fun ThemeModePill(
 }
 
 /**
- * 💡 核心算法：并行网络竞争获取 IPv6
- * 多个 API 同时请求，谁最快返回谁
+ * 💡 终极修复版：并行网络竞争（真正抢答、0毫秒等待、不等待慢速清理）
  */
-private suspend fun raceFetchIpv6(apis: List<String>): InetAddress? = coroutineScope {
-    // 一个用于接收第一个成功的异步结果的容器
-    val deferredResult = CompletableDeferred<InetAddress>()
+private suspend fun raceFetchIpv6(apis: List<String>): InetAddress? {
+    // 创建一个完全独立的临时协程作用域，脱离原先 coroutineScope 的强绑定限制
+    val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    val deferredResult = CompletableDeferred<InetAddress?>()
+    val totalTasks = apis.size
+    val failedCount = java.util.concurrent.atomic.AtomicInteger(0)
 
-    // 启动与 API 数量相等的并发任务
-    val jobs = apis.map { api ->
-        launch(Dispatchers.IO) {
+    apis.forEach { api ->
+        scope.launch {
             try {
-                // 每一个任务都在后台独立请求
                 val ip = TcpPunchTransfer.getPublicIpv6FromApi(api)
                 if (ip != null) {
-                    // 抢答成功！第一个塞入结果的任务会触发 complete
-                    deferredResult.complete(ip)
+                    deferredResult.complete(ip) // 🏆 胜者瞬间抢答！
+                } else {
+                    if (failedCount.incrementAndGet() >= totalTasks) {
+                        deferredResult.complete(null)
+                    }
                 }
-            } catch (ignored: Exception) {
-                // 失败了无所谓，等其他兄弟任务完成
+            } catch (e: Exception) {
+                if (failedCount.incrementAndGet() >= totalTasks) {
+                    deferredResult.complete(null)
+                }
             }
         }
     }
 
-    try {
-        // 挂起并等待第一个抢答成功的 IP
+    return try {
+        // 💡 关键：只等抢答结果。一旦拿到，立刻通过 finally 返回，绝不拖泥带水
         deferredResult.await()
     } catch (e: Exception) {
         null
     } finally {
-        // 💡 关键：一旦拿到第一名（或者超时退出），立刻在后台杀死所有其他还在请求的顽固任务！
-        // 释放手机 socket 资源和流量
-        jobs.forEach { it.cancel() }
+        // 💡 瞬间杀死并销毁整个临时作用域，慢速任务的清理工作在后台慢慢进行，绝不卡死主进程
+        scope.cancel()
     }
 }
 
