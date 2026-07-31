@@ -336,6 +336,9 @@ public class TcpPunchTransfer {
 
                 AppLogger.info("[DPI] Successfully exchanged and cleaned FakeHTTP headers.");
                 if (statusListener != null) statusListener.onStatusUpdate("通道就绪！");
+                // 💡 修改 1：在 connectByPunch 成功返回前，加上这一行：
+                socket.setKeepAlive(true);
+                socket.setTcpNoDelay(true); // 禁用 Nagle 算法，让心跳和数据立刻发出 [1]
                 return socket;
             } catch (Exception e) {
                 try {
@@ -388,7 +391,7 @@ public class TcpPunchTransfer {
         }
     }
 
-    public void receiveFile(Socket socket, String saveDir, ProgressListener listener) {
+    public boolean receiveFile(Socket socket, String saveDir, ProgressListener listener) {
         File destFile = null;
         String fileName = "unknown";
         try (InputStream is = new NonCloseableInputStream(socket.getInputStream());
@@ -402,13 +405,13 @@ public class TcpPunchTransfer {
             }
 
             if ("HEARTBEAT".equals(metaData)) {
-                return;
+                return false;
             }
 
             if (!metaData.startsWith("PREPARE:")) {
                 os.write("REJECT\n".getBytes(StandardCharsets.UTF_8));
                 os.flush();
-                return;
+                return false;
             }
 
             String[] parts = metaData.split(":");
@@ -439,6 +442,7 @@ public class TcpPunchTransfer {
                 }
                 fos.flush();
                 AppLogger.info("[SUCCESS] File [{}] received successfully!", fileName);
+                return true;
             }
         } catch (Exception e) {
             AppLogger.error("Error occurred while receiving file: " + fileName, e);

@@ -111,6 +111,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.net.InetAddress
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.ui.unit.Dp
 
 enum class ActiveTab { TRANSFER, SETTINGS }
 enum class SessionState { IDLE, CONNECTING, ACTIVE }
@@ -410,18 +415,26 @@ class MainActivity : ComponentActivity() {
         }
 
         // 💡 智能药丸自动化生命周期监听二：传输连接阶段
+        // 💡 智能药丸自动化生命周期监听二：传输连接阶段
         LaunchedEffect(isTransferring.value, statusText.value) {
             if (isTransferring.value) {
-                pillText = statusText.value
+                // 💡 按照约定，只对这三个关键状态进行极致精简翻译，其他保持原样
+                pillText = when {
+                    statusText.value.startsWith("正在发送:") -> "发送中..."
+                    statusText.value.startsWith("正在接收:") -> "接收中..."
+                    statusText.value == "穿透成功！建立长周期会话。" -> "通道已打通"
+                    else -> statusText.value
+                }
+
                 if (pillState == PillState.HIDDEN) {
                     pillState = PillState.POP_CIRCLE
-                    delay(1000) // 💡 弹起圆点，静止 1 秒
+                    delay(1000) // 弹起圆点，静止 1 秒
                 }
                 pillState = PillState.EXTEND_PILL
             } else {
                 if (pillState == PillState.EXTEND_PILL) {
                     pillState = PillState.POP_CIRCLE
-                    delay(600) // 💡 等待缩圆
+                    delay(600) // 等待缩圆
                     pillState = PillState.HIDDEN
                 }
             }
@@ -548,6 +561,31 @@ class MainActivity : ComponentActivity() {
 
                 try { Thread.sleep(500) } catch (ignored: Exception) {}
                 resetMyConnectionCode()
+            }
+        }
+
+        // 💡 自动心跳守护协程：只要在 ACTIVE 状态下且自己是发送端，每 15 秒往对方发一次 HEARTBEAT [1]
+        LaunchedEffect(sessionState.value) {
+            if (sessionState.value == SessionState.ACTIVE && isSenderRole.value) {
+                while (activeSocket.value != null && !activeSocket.value!!.isClosed) {
+                    delay(15000) // 每 15 秒心跳一次，刚好能瞒过运营商的防火墙 [1]
+                    try {
+                        withContext(Dispatchers.IO) {
+                            val os = activeSocket.value?.getOutputStream()
+                            // 发送心跳包
+                            os?.write("HEARTBEAT\n".toByteArray(Charsets.UTF_8))
+                            os?.flush()
+                        }
+                    } catch (e: Exception) {
+                        // 心跳发送失败（说明通道已经断了），立即触发断开
+                        this@MainActivity.runOnUiThread {
+                            statusText.value = "连接已断开"
+                        }
+                        delay(2000)
+                        cancelActiveTransfer()
+                        break
+                    }
+                }
             }
         }
 
@@ -1227,6 +1265,11 @@ class MainActivity : ComponentActivity() {
 
                                                                         try { Thread.sleep(1500) } catch (ignored: Exception) {}
 
+                                                                        this@MainActivity.runOnUiThread {
+                                                                            isTransferring.value = false // 💡 穿透建立会话后，先恢复为 false，使其显示 LoadingIndicator
+                                                                            statusText.value = if (isSenderRole.value) "等待选择文件..." else "等待对方发送文件..."
+                                                                        }
+
                                                                         sessionState.value = SessionState.ACTIVE
 
                                                                         if (!isSenderRole.value) {
@@ -1237,9 +1280,26 @@ class MainActivity : ComponentActivity() {
                                                                             if (!everyShareDir.exists()) everyShareDir.mkdirs()
                                                                             val saveDir = if (everyShareDir.exists()) everyShareDir.absolutePath else downloadDir.absolutePath
 
+                                                                            // 重新定义一个接收端的专用 listener，在收到数据的第一个字节时，自动激活波浪圆圈
+                                                                            val rxListener = ProgressListener { name, read, total, speed ->
+                                                                                this@MainActivity.runOnUiThread {
+                                                                                    isTransferring.value = true // 💡 只要开始读数据，左侧立刻无缝切换到波浪圆圈
+                                                                                    progressPercent.value = ((read.toDouble() / total) * 100).toInt()
+                                                                                    currentSpeed.value = speed
+                                                                                    statusText.value = "正在接收: $name"
+                                                                                }
+                                                                            }
+
                                                                             while (activeSocket.value != null && !activeSocket.value!!.isClosed) {
-                                                                                puncher.receiveFile(socket, saveDir, listener)
-                                                                                this@MainActivity.runOnUiThread { statusText.value = "🎉 接收成功！已存入公共下载目录" }
+                                                                                puncher.receiveFile(socket, saveDir, rxListener)
+
+                                                                                // 💡 传输完毕后的重置与去 Emoji 文案修改 [5]
+                                                                                this@MainActivity.runOnUiThread {
+                                                                                    isTransferring.value = false // 💡 传输成功后，变回 LoadingIndicator
+                                                                                    statusText.value = "接收成功，已存入Download/EveryShare" // 💡 去除 Emoji 后的新文案
+                                                                                    progressPercent.value = 0
+                                                                                    currentSpeed.value = 0.0
+                                                                                }
                                                                             }
                                                                         }
                                                                     } else {
@@ -1249,10 +1309,15 @@ class MainActivity : ComponentActivity() {
                                                                         }
                                                                     }
                                                                 } catch (e: Exception) {
-                                                                    AppLogger.error("会话执行失败", e)
+                                                                    AppLogger.error("接收端会话异常", e)
+                                                                    // 💡 异常发生（说明对方主动关闭或网络断开），在 UI 上提示 [2.1.2]
                                                                     this@MainActivity.runOnUiThread {
+                                                                        statusText.value = "连接已断开"
                                                                         isTransferring.value = false
                                                                     }
+                                                                    // 停顿 2 秒让用户看清提示，然后干净地退回主界面
+                                                                    try { Thread.sleep(2000) } catch (ignored: Exception) {}
+                                                                    cancelActiveTransfer()
                                                                 } finally {
                                                                     this@MainActivity.runOnUiThread {
                                                                         isTransferring.value = false
@@ -1346,47 +1411,104 @@ class MainActivity : ComponentActivity() {
                                         }
                                     } else if (state == SessionState.ACTIVE) {
                                         // ==========================================
-                                        //               「会话传输中」界面
+                                        //               「会话传输中」界面 (M3 Expressive)
                                         // ==========================================
-                                        Text(
-                                            text = "传输会话",
-                                            fontSize = 32.sp,
-                                            fontWeight = FontWeight.Black,
-                                            color = MaterialTheme.colorScheme.onBackground,
-                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp),
-                                            textAlign = TextAlign.Start
-                                        )
-
-                                        Spacer(modifier = Modifier.height(10.dp))
-
-                                        // 💡 双排大图标组合：左侧为灵动药丸 (SmartPill)，右侧为会话网络状况
+                                        // 💡 1. 核心重组：大标题与药丸合并至同一行，删去原先的多余副标题行 [2.1.2]
                                         Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .animateContentSize(
-                                                    animationSpec = spring(
-                                                        dampingRatio = Spring.DampingRatioMediumBouncy,
-                                                        stiffness = Spring.StiffnessLow
-                                                    )
-                                                ),
+                                            modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp),
                                             horizontalArrangement = Arrangement.SpaceBetween,
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             Text(
-                                                text = "● 已建立安全隧道 | RTT: 测量中...",
-                                                fontFamily = FontFamily.Monospace,
-                                                fontSize = 10.sp,
-                                                color = Color.Gray,
-                                                modifier = Modifier.padding(horizontal = 6.dp)
+                                                text = "传输会话",
+                                                fontSize = 32.sp,
+                                                fontWeight = FontWeight.Black,
+                                                color = MaterialTheme.colorScheme.onBackground
                                             )
 
-                                            // 💡 传输中在右上角常驻展示灵动药丸
                                             SmartPillShell(state = pillState, text = pillText)
-                                            Spacer(modifier = Modifier.width(6.dp))
                                         }
 
-                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Spacer(modifier = Modifier.height(14.dp))
 
+                                        // 💡 2. 传输状态大卡片 (Status Card)
+                                        Card(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(24.dp)), // 物理遮罩
+                                            colors = CardDefaults.cardColors(containerColor = cardBg),
+                                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                                        ) {
+                                            // 保持高度 140.dp，确保背景波浪流动空间
+                                            Box(modifier = Modifier.fillMaxWidth().height(140.dp)) {
+
+                                                // 【图层 1：底层】大河漂流传送带 [1]
+                                                DriftingBackgroundWaves(
+                                                    progress = progressPercent.value / 100f,
+                                                    isDark = isDark
+                                                )
+
+                                                // 【图层 2：前台】信息内容展示
+                                                Row(
+                                                    modifier = Modifier.fillMaxSize().padding(16.dp),
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(16.dp)
+                                                ) {
+                                                    // 💡 左侧圆形：只有真正传输时才转为 CircularWavyProgressIndicator，平时保持为 LoadingIndicator [2]
+                                                    Box(
+                                                        modifier = Modifier.size(54.dp),
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        @OptIn(ExperimentalMaterial3ExpressiveApi::class)
+                                                        if (isTransferring.value) {
+                                                            CircularWavyProgressIndicator(
+                                                                progress = { progressPercent.value / 100f },
+                                                                color = MaterialTheme.colorScheme.primary,
+                                                                modifier = Modifier.size(36.dp)
+                                                            )
+                                                        } else {
+                                                            @OptIn(ExperimentalMaterial3ExpressiveApi::class)
+                                                            LoadingIndicator(
+                                                                modifier = Modifier.size(24.dp),
+                                                                color = MaterialTheme.colorScheme.primary
+                                                            )
+                                                        }
+                                                    }
+
+                                                    // 垂直分割线
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(1.dp)
+                                                            .height(48.dp)
+                                                            .background(Color.LightGray.copy(alpha = 0.4f))
+                                                    )
+
+                                                    // 状态文字与速度
+                                                    Column(
+                                                        modifier = Modifier.weight(1f),
+                                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = statusText.value,
+                                                            fontSize = 15.sp,
+                                                            fontWeight = FontWeight.Bold,
+                                                            color = cardTextColor
+                                                        )
+                                                        if (isTransferring.value) {
+                                                            Text(
+                                                                text = String.format("速度: %.2f MB/s | 进度: %d%%", currentSpeed.value, progressPercent.value),
+                                                                fontSize = 12.sp,
+                                                                color = Color.Gray
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Spacer(modifier = Modifier.height(8.dp))
+
+                                        // 【居中】选择文件卡片（去掉了文件夹 Emoji）
                                         if (isSenderRole.value) {
                                             Card(
                                                 modifier = Modifier.fillMaxWidth().bounceClick {
@@ -1395,9 +1517,14 @@ class MainActivity : ComponentActivity() {
                                                 colors = CardDefaults.cardColors(containerColor = cardBg),
                                                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                                             ) {
-                                                Column(modifier = Modifier.padding(12.dp)) {
-                                                    Text(text = "📂 选择要发送的文件 (点击浏览):", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary)
-                                                    Spacer(modifier = Modifier.height(4.dp))
+                                                Column(modifier = Modifier.padding(16.dp)) {
+                                                    Text(
+                                                        text = "选择要发送的文件 (点击浏览):",
+                                                        fontSize = 13.sp,
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        fontWeight = FontWeight.Bold
+                                                    )
+                                                    Spacer(modifier = Modifier.height(8.dp))
                                                     Text(
                                                         text = if (selectedFileName.value.isEmpty()) "点击选择手机上的任意文件" else "${selectedFileName.value} (${selectedFileSize.value / 1024 / 1024} MB)",
                                                         fontSize = 14.sp,
@@ -1405,67 +1532,75 @@ class MainActivity : ComponentActivity() {
                                                     )
                                                 }
                                             }
-
-                                            Spacer(modifier = Modifier.height(8.dp))
-
-                                            Button(
-                                                onClick = {
-                                                    if (activeSocket.value == null || selectedFileUri.value == null || isCachingFile.value) return@Button
-                                                    if (remoteCode.value.trim() == myCode.value.trim()) {
-                                                        android.widget.Toast.makeText(context, "不能连接到自己", android.widget.Toast.LENGTH_SHORT).show()
-                                                        return@Button
-                                                    }
-                                                    isTransferring.value = true
-                                                    statusText.value = "正在通过已建立通道上传..."
-
-                                                    val t = thread {
-                                                        try {
-                                                            val puncher = TcpPunchTransfer()
-                                                            val listener = ProgressListener { name, read, total, speed ->
-                                                                progressPercent.value = ((read.toDouble() / total) * 100).toInt()
-                                                                currentSpeed.value = speed
-                                                                statusText.value = "🚀 正在发送: $name"
-                                                            }
-                                                            val tempCacheFile = File(context.cacheDir, "temp_upload.dat")
-                                                            FileInputStream(tempCacheFile).use { fileInputStream ->
-                                                                puncher.sendFile(activeSocket.value!!, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
-                                                            }
-                                                            AppLogger.info("🎉 文件发送完成！通道继续保持。")
-                                                        } catch (e: Exception) {
-                                                            AppLogger.error("发送出错", e)
-                                                        } finally {
-                                                            this@MainActivity.runOnUiThread {
-                                                                isTransferring.value = false
-                                                                selectedFileUri.value = null
-                                                                selectedFileName.value = ""
-                                                            }
-                                                            activeTransferThread.value = null
-                                                        }
-                                                    }
-                                                    activeTransferThread.value = t
-                                                },
-                                                modifier = Modifier.fillMaxWidth().height(50.dp),
-                                                enabled = !isTransferring.value && !isCachingFile.value && selectedFileUri.value != null
-                                            ) {
-                                                Text("直接发送选中的文件")
-                                            }
-                                        }
-
-                                        Text(text = "传输状态: ${statusText.value}", fontSize = 14.sp)
-
-                                        if (isTransferring.value) {
-                                            LinearProgressIndicator(progress = { progressPercent.value / 100f }, modifier = Modifier.fillMaxWidth())
-                                            Text(text = String.format("速度: %.2f MB/s | 进度: %d%%", currentSpeed.value, progressPercent.value), fontSize = 13.sp)
                                         }
 
                                         Spacer(modifier = Modifier.weight(1f))
 
-                                        Button(
-                                            onClick = { cancelActiveTransfer() },
+                                        // 【居底】双排小尺寸并排按钮
+                                        Row(
                                             modifier = Modifier.fillMaxWidth(),
-                                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                                            horizontalArrangement = Arrangement.spacedBy(16.dp),
+                                            verticalAlignment = Alignment.CenterVertically
                                         ) {
-                                            Text("断开连接并结束会话")
+                                            if (isSenderRole.value) {
+                                                Button(
+                                                    onClick = {
+                                                        if (activeSocket.value == null || selectedFileUri.value == null || isCachingFile.value) return@Button
+                                                        isTransferring.value = true
+                                                        statusText.value = "正在上传文件..."
+
+                                                        val t = thread {
+                                                            try {
+                                                                val puncher = TcpPunchTransfer()
+                                                                val listener = ProgressListener { name, read, total, speed ->
+                                                                    progressPercent.value = ((read.toDouble() / total) * 100).toInt()
+                                                                    currentSpeed.value = speed
+                                                                    statusText.value = "正在发送: $name"
+                                                                }
+                                                                val tempCacheFile = File(context.cacheDir, "temp_upload.dat")
+                                                                FileInputStream(tempCacheFile).use { fileInputStream ->
+                                                                    puncher.sendFile(activeSocket.value!!, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
+                                                                }
+                                                                AppLogger.info("🎉 文件发送完成！")
+                                                                this@MainActivity.runOnUiThread {
+                                                                    statusText.value = "等待选择文件..."
+                                                                }
+                                                            } catch (e: Exception) {
+                                                                AppLogger.error("发送出错", e)
+                                                                // 💡 异常发生，提示并断开
+                                                                this@MainActivity.runOnUiThread {
+                                                                    statusText.value = "连接已断开"
+                                                                    isTransferring.value = false
+                                                                }
+                                                                try { Thread.sleep(2000) } catch (ignored: Exception) {}
+                                                                cancelActiveTransfer()
+                                                            } finally {
+                                                                this@MainActivity.runOnUiThread {
+                                                                    isTransferring.value = false
+                                                                    selectedFileUri.value = null
+                                                                    selectedFileName.value = ""
+                                                                }
+                                                                activeTransferThread.value = null
+                                                            }
+                                                        }
+                                                        activeTransferThread.value = t
+                                                    },
+                                                    shape = CircleShape,
+                                                    modifier = Modifier.weight(1f).height(44.dp), // 缩小的开始按钮
+                                                    enabled = !isTransferring.value && !isCachingFile.value && selectedFileUri.value != null
+                                                ) {
+                                                    Text("发送选中的文件", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                                }
+                                            }
+
+                                            Button(
+                                                onClick = { cancelActiveTransfer() },
+                                                shape = CircleShape,
+                                                modifier = Modifier.weight(1f).height(44.dp), // 缩小的断开按钮
+                                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                                            ) {
+                                                Text("断开连接", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                            }
                                         }
                                     }
                                 }
@@ -2251,6 +2386,75 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// 💡 定义每一条漂流波浪的数据结构 [1]
+data class WaveTrack(
+    val id: Int,
+    val yOffset: Dp,
+    val width: Dp,
+    val durationMillis: Int,
+    val initialDelayMillis: Int
+)
+
+/**
+ * 💡 核心动效：背景“传送带”漂流波浪组件 [1]
+ * 6 条官方波浪轨道在后台交错运动，其自身的 progress 实时绑定文件传输的实际进度 [1, 2]
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun DriftingBackgroundWaves(progress: Float, isDark: Boolean) {
+    val infiniteTransition = rememberInfiniteTransition(label = "BackgroundWaves")
+
+    // 💡 物理轨迹库：不同高度、不同宽度（长短不一）、不同速度（快慢交错），营造极佳的水流层次感 [1]
+    val tracks = remember {
+        listOf(
+            WaveTrack(1, 10.dp, 120.dp, 8000, 0),
+            WaveTrack(2, 28.dp, 80.dp, 6000, 1500),
+            WaveTrack(3, 46.dp, 140.dp, 10000, 500),
+            WaveTrack(4, 64.dp, 95.dp, 7000, 2000),
+            WaveTrack(5, 82.dp, 115.dp, 9000, 1000),
+            WaveTrack(6, 100.dp, 75.dp, 5500, 2500)
+        )
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        tracks.forEach { track ->
+            // 💡 利用无限循环过渡，让每一条波浪的 X 轴偏移量平滑向右递增 [1]
+            val progressFloat by infiniteTransition.animateFloat(
+                initialValue = 0f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(
+                        durationMillis = track.durationMillis,
+                        delayMillis = track.initialDelayMillis,
+                        easing = LinearEasing // 线性平滑滑行，绝不卡顿
+                    ),
+                    repeatMode = RepeatMode.Restart
+                ),
+                label = "WaveTranslation_${track.id}"
+            )
+
+            // 💡 传送带物理位移计算：从左侧 -150.dp（隐藏出生）平滑滑行至右侧 400.dp（隐藏消逝） [1]
+            val startX = -150.dp
+            val endX = 400.dp
+            val currentX = startX + (endX - startX) * progressFloat
+
+            // 💡 调用官方原生波浪组件 [1, 2]
+            LinearWavyProgressIndicator(
+                progress = { progress }, // 实时绑定传输进度！ [2]
+                modifier = Modifier
+                    .offset(x = currentX, y = track.yOffset)
+                    .width(track.width) // 随机的长短不一
+                    .graphicsLayer {
+                        // 💡 极致的半透明：既有隐约的流体光泽，又绝对不干扰前台文字阅读 [1]
+                        alpha = if (isDark) 0.05f else 0.08f
+                    },
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = Color.Transparent // 隐藏灰色背景轨道，让视觉极其干净
+            )
+        }
+    }
+}
+
 // 💡 智能药丸（SmartPill）动画外壳包装器
 @Composable
 fun SmartPillShell(state: PillState, text: String) {
@@ -2290,7 +2494,6 @@ fun SmartPill(state: PillState, text: String) {
             .height(36.dp)
             .clip(CircleShape)
             .background(MaterialTheme.colorScheme.primary)
-            // 💡 1. 唯一尺寸动画控制：缩短至 450ms，动作更加清爽、干脆
             .animateContentSize(
                 animationSpec = tween(
                     durationMillis = 450,
@@ -2298,8 +2501,6 @@ fun SmartPill(state: PillState, text: String) {
                 )
             )
             .then(pillWidthModifier)
-            // 💡 2. 核心修复：彻底干掉动画边距，使用固定的 8.dp 黄金常数！
-            // 完美适配正圆居中与长条对称，彻底解决双重动画导致的粘滞感与抖动 [2.1.2]
             .padding(horizontal = 8.dp),
         contentAlignment = Alignment.CenterStart // 左侧物理锚点固定
     ) {
@@ -2308,7 +2509,7 @@ fun SmartPill(state: PillState, text: String) {
             horizontalArrangement = Arrangement.Start,
             modifier = Modifier.fillMaxHeight()
         ) {
-            // 左侧加载圆圈：因为左边距永远是 8.dp，它在动画全程中会绝对静止在左侧！
+            // 左侧加载圆圈
             Box(
                 modifier = Modifier.size(20.dp),
                 contentAlignment = Alignment.Center
@@ -2339,6 +2540,9 @@ fun SmartPill(state: PillState, text: String) {
                         modifier = Modifier.clip(CircleShape)
                     )
                 }
+                // 💡 核心微调：仅在展开状态下，在文字右侧增加 4.dp 的物理占位 [2.1.2]
+                // 这样右侧总间距变为（4.dp占位 + 8.dp外边距 = 12.dp），完美与左侧视觉重心实现对称！ [2.1.2]
+                Spacer(modifier = Modifier.width(4.dp))
             }
         }
     }
