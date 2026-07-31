@@ -202,13 +202,17 @@ public class TcpPunchTransfer {
                     Thread.sleep(80);
                 }
 
+                // 💡 修复代码：
                 double rtt = rttSamples.isEmpty() ? 40.0 : rttSamples.stream().mapToDouble(Double::doubleValue).average().orElse(40.0);
                 double oneWayDelay = rtt / 2.0;
-                double targetDelay = 200.0;
+
+                // 保证目标延迟永远大于单向延迟，给 slaveWait 留出至少 100ms 的正数等待缓冲 [2]
+                double targetDelay = Math.max(200.0, oneWayDelay + 100.0);
                 double masterWait = targetDelay;
                 double slaveWait = targetDelay - oneWayDelay;
 
-                AppLogger.info("[UDP] Calibration done: RTT = {}ms", String.format("%.1f", rtt));
+                AppLogger.info("[UDP] Calibration done: RTT = {}ms, targetDelay = {}ms",
+                        String.format("%.1f", rtt), String.format("%.1f", targetDelay));
                 if (statusListener != null) {
                     statusListener.onStatusUpdate("时延校准完成: RTT = " + String.format("%.1f", rtt) + "ms");
                 }
@@ -308,6 +312,7 @@ public class TcpPunchTransfer {
                 if (statusListener != null) statusListener.onStatusUpdate("打通成功！正在清洗混淆数据...");
                 AppLogger.info("[SUCCESS] TCP punch established successfully!");
 
+                // 💡 修复代码：
                 OutputStream os = socket.getOutputStream();
                 InputStream is = socket.getInputStream();
 
@@ -315,11 +320,16 @@ public class TcpPunchTransfer {
                 os.write(fakeHeader.getBytes(StandardCharsets.UTF_8));
                 os.flush();
 
-                // 💡 完美有限状态机：严格单字节匹配并有序清洗 \r\n\r\n 报头结束符并安全洗涤 [2.1.2]
                 int state = 0;
+                int bytesRead = 0; // 记录读取的字节数
                 while (true) {
                     int b = is.read();
                     if (b == -1) throw new IOException("Connection closed prematurely");
+
+                    bytesRead++;
+                    if (bytesRead > 8192) { // 💡 防御性编程：如果洗了 8KB 还没洗完，说明不是我们的协议，判定为恶意扫描，直接掐断！ [2.1.2]
+                        throw new IOException("Malformed HTTP header or attack detected");
+                    }
 
                     if (state == 0 && b == '\r') {
                         state = 1;

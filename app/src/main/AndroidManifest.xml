@@ -29,12 +29,15 @@
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:screenOrientation="portrait"
             android:theme="@style/Theme.EveryShare">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
         </activity>
         <!-- 💡 放在 <application> 标签内部的最下方 -->
         <!-- 强制覆盖 Zxing 的扫码 Activity 确保在所有手机上都是竖屏，彻底解决横屏闪烁 Bug -->

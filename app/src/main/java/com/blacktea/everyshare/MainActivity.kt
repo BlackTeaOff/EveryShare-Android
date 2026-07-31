@@ -381,6 +381,27 @@ class MainActivity : ComponentActivity() {
             if (count == 0) 1 else count
         }
 
+        // 💡 核心修复：使用 Compose 专用的生命周期监听器
+        // 当组件卸载、Activity 销毁、或手机旋转屏幕时，会自动、安全地触发 onDispose 里的清理工作 [1, 2]
+        DisposableEffect(Unit) {
+            onDispose {
+                try {
+                    // 1. 强行终止正在运行的传输线程
+                    activeTransferThread.value?.interrupt()
+                    activeTransferThread.value = null
+
+                    // 2. 关闭底层 Socket
+                    activeSocket.value?.close()
+                    activeSocket.value = null
+
+                    // 3. 停止前台服务 [2]
+                    context.stopService(Intent(context, EveryShareService::class.java))
+
+                    AppLogger.info("[Teardown] 页面销毁，已成功释放所有网络和线程资源")
+                } catch (ignored: Exception) {}
+            }
+        }
+
         fun getLogoResId(index: Int): Int {
             val resId = context.resources.getIdentifier("logo_$index", "drawable", context.packageName)
             return if (resId != 0) resId else R.drawable.avatar
@@ -1257,16 +1278,24 @@ class MainActivity : ComponentActivity() {
 
 
                                                                         // 💡 核心修复：在这里启动一个不受 Android UI 限制的纯 Java 后台守护线程发送心跳 [1, 2]
+                                                                        // 💡 修改后：发送端后台心跳线程
                                                                         if (isSenderRole.value) {
                                                                             thread(isDaemon = true) {
                                                                                 val socket = activeSocket.value
                                                                                 while (socket != null && !socket.isClosed) {
                                                                                     try {
                                                                                         Thread.sleep(15000) // 15秒一跳 [1]
-                                                                                        val os = socket.getOutputStream()
-                                                                                        os.write("HEARTBEAT\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
-                                                                                        os.flush()
-                                                                                        Log.d("EveryShare", "发送端后台心跳成功...")
+
+                                                                                        // 💡 核心修复 1：只有在非传输状态（IDLE 状态）下，才允许发送心跳包
+                                                                                        if (!isTransferring.value && sessionState.value == SessionState.ACTIVE) {
+                                                                                            val os = socket.getOutputStream()
+                                                                                            // 💡 核心修复 2：加锁，防止与刚准备开始传输的文件流产生线程冲突
+                                                                                            synchronized(os) {
+                                                                                                os.write("HEARTBEAT\n".toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                                                                                                os.flush()
+                                                                                            }
+                                                                                            Log.d("EveryShare", "发送端后台静默心跳成功...")
+                                                                                        }
                                                                                     } catch (e: Exception) {
                                                                                         AppLogger.error("后台心跳失败，连接已断开", e)
                                                                                         this@MainActivity.runOnUiThread {
@@ -1548,12 +1577,13 @@ class MainActivity : ComponentActivity() {
 
                                         Spacer(modifier = Modifier.weight(1f))
 
-                                        // 【居底】双排小尺寸并排按钮
+                                        // 💡 【居底】双排小尺寸并排按钮（已修复）
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
                                             horizontalArrangement = Arrangement.spacedBy(16.dp),
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
+                                            // 💡 1. 真正的“发送选中的文件”按钮在这里！
                                             if (isSenderRole.value) {
                                                 Button(
                                                     onClick = {
@@ -1570,16 +1600,20 @@ class MainActivity : ComponentActivity() {
                                                                     statusText.value = "正在发送: $name"
                                                                 }
 
-                                                                // 💡 核心优化：直接从 Android 系统获取该 URI 的输入流，直接喂给 Java 引擎！ [1, 2]
+                                                                // 💡 直接流式发送，无需本地磁盘缓存
                                                                 context.contentResolver.openInputStream(selectedFileUri.value!!).use { fileInputStream ->
                                                                     if (fileInputStream != null) {
-                                                                        puncher.sendFile(activeSocket.value!!, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
+                                                                        val os = activeSocket.value!!.getOutputStream()
+                                                                        // 💡 核心修复：对输出流上锁，保证大文件安全不损坏 [1, 2.1.2]
+                                                                        synchronized(os) {
+                                                                            puncher.sendFile(activeSocket.value!!, fileInputStream, selectedFileName.value, selectedFileSize.value, listener)
+                                                                        }
                                                                     } else {
                                                                         throw java.io.IOException("无法打开文件输入流")
                                                                     }
                                                                 }
 
-                                                                AppLogger.info("🎉 文件发送完成！")
+                                                                AppLogger.info("文件发送完成！")
                                                                 this@MainActivity.runOnUiThread {
                                                                     statusText.value = "等待选择文件..."
                                                                 }
@@ -1603,17 +1637,19 @@ class MainActivity : ComponentActivity() {
                                                         activeTransferThread.value = t
                                                     },
                                                     shape = CircleShape,
-                                                    modifier = Modifier.weight(1f).height(44.dp), // 缩小的开始按钮
-                                                    enabled = !isTransferring.value && !isCachingFile.value && selectedFileUri.value != null
+                                                    modifier = Modifier.weight(1f).height(44.dp), // 占半宽
+                                                    // 只有在非传输中，且已经选了文件的情况下，按钮才允许点击
+                                                    enabled = !isTransferring.value && selectedFileUri.value != null
                                                 ) {
                                                     Text("发送选中的文件", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                                                 }
                                             }
 
+                                            // 💡 2. “断开连接”按钮
                                             Button(
                                                 onClick = { cancelActiveTransfer() },
                                                 shape = CircleShape,
-                                                modifier = Modifier.weight(1f).height(44.dp), // 缩小的断开按钮
+                                                modifier = Modifier.weight(1f).height(44.dp), // 占半宽
                                                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
                                             ) {
                                                 Text("断开连接", fontSize = 13.sp, fontWeight = FontWeight.Bold)

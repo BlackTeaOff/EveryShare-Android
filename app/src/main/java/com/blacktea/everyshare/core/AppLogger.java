@@ -16,10 +16,9 @@ public class AppLogger {
         log.info(format, arguments);
         String formatted = format;
         for (Object arg : arguments) {
-            if (arg != null) {
-                // 💡 使用 Matcher.quoteReplacement 保护参数，防止特殊字符（如 $ 和 \）导致正则解析崩溃
-                formatted = formatted.replaceFirst("\\{\\}", java.util.regex.Matcher.quoteReplacement(arg.toString()));
-            }
+            // 💡 核心修复：增加非空防空指针机制，如果是 null 替换为 "null" 字符串
+            String argStr = (arg == null) ? "null" : arg.toString();
+            formatted = formatted.replaceFirst("\\{\\}", java.util.regex.Matcher.quoteReplacement(argStr));
         }
         append("[INFO] " + formatted);
     }
